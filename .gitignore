@@ -1,0 +1,14 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# ROS 2 / colcon
+build/
+install/
+log/
+
+# Working notes, not part of the published package.
+# Remove this line if you do want to publish it.
+infomações.md
