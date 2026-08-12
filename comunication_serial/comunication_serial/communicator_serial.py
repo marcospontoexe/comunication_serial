@@ -1,7 +1,4 @@
-"""
-communicator_serial.py
-
-Reliable communication with an ESP32 over USB serial.
+r"""Reliable communication with an ESP32 over USB serial.
 
 - Outgoing message format: "MSG;<id>;COMMAND;ARGS\n"
     - Hardware shutdown:      "MSG;<id>;POWER_OFF"
@@ -23,24 +20,27 @@ Reliable communication with an ESP32 over USB serial.
 - Detailed logging through the rclpy logger, with an optional rotating file
 """
 
-import serial
+from collections import deque
+from enum import Enum
+import logging
+from logging.handlers import RotatingFileHandler
+import os
 import threading
 import time
-import logging
-import os
+
 import rclpy
-from collections import deque
-from logging.handlers import RotatingFileHandler
-from rclpy.node import Node
 from rclpy.logging import LoggingSeverity
-from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy, QoSDurabilityPolicy
-from std_msgs.msg import String as RosString
-from std_msgs.msg import Int32 as RosInt32
+from rclpy.node import Node
+from rclpy.qos import QoSDurabilityPolicy, QoSHistoryPolicy, QoSProfile, QoSReliabilityPolicy
+import serial
 from std_msgs.msg import Bool as RosBool
-from enum import Enum
+from std_msgs.msg import Int32 as RosInt32
+from std_msgs.msg import String as RosString
 
 
 class LogsLevel(Enum):
+    """Severity levels used across this module."""
+
     debug = 0
     info = 1
     warning = 2
@@ -51,25 +51,25 @@ class LogsLevel(Enum):
 # Maps the internal level onto the rclpy severity. Used to configure the node
 # logger so that LOG_LEVEL alone decides what gets emitted.
 ROS_SEVERITY = {
-    LogsLevel.debug:   LoggingSeverity.DEBUG,
-    LogsLevel.info:    LoggingSeverity.INFO,
+    LogsLevel.debug: LoggingSeverity.DEBUG,
+    LogsLevel.info: LoggingSeverity.INFO,
     LogsLevel.warning: LoggingSeverity.WARN,
-    LogsLevel.error:   LoggingSeverity.ERROR,
-    LogsLevel.fatal:   LoggingSeverity.FATAL,
+    LogsLevel.error: LoggingSeverity.ERROR,
+    LogsLevel.fatal: LoggingSeverity.FATAL,
 }
 
 # Maps the internal level onto the stdlib logging levels (only used for the
 # optional log file).
 STD_LEVEL = {
-    LogsLevel.debug:   logging.DEBUG,
-    LogsLevel.info:    logging.INFO,
+    LogsLevel.debug: logging.DEBUG,
+    LogsLevel.info: logging.INFO,
     LogsLevel.warning: logging.WARNING,
-    LogsLevel.error:   logging.ERROR,
-    LogsLevel.fatal:   logging.CRITICAL,
+    LogsLevel.error: logging.ERROR,
+    LogsLevel.fatal: logging.CRITICAL,
 }
 
 # Settings
-PORT = "/dev/ESP"   # adjust to your system; see the udev section in the README
+PORT = '/dev/ESP'   # adjust to your system; see the udev section in the README
 BAUD = 115200
 HEARTBEAT_INTERVAL = 0.5      # seconds between PINGs
 ACK_TIMEOUT = 1.0
@@ -84,7 +84,7 @@ SEEN_IDS_MAXLEN = 16
 
 # Optional rotating log file. None = only the rclpy logger, which already writes
 # to the console and to /rosout. Set a path to keep history on disk, for example
-# "/var/log/serial_comm_node.log".
+# '/var/log/serial_comm_node.log'.
 LOG_FILE = None
 LOG_FILE_MAX_BYTES = 5 * 1024 * 1024
 LOG_FILE_BACKUP_COUNT = 3
@@ -98,7 +98,8 @@ class PendingAck:
     explicit rejection) would be indistinguishable from an ACK, and the sender
     would report success for a message the other side threw away.
     """
-    __slots__ = ('event', 'status', 'reason')
+
+    __slots__ = ('event', 'reason', 'status')
 
     PENDING = 0
     ACK = 1
@@ -107,25 +108,24 @@ class PendingAck:
     def __init__(self):
         self.event = threading.Event()
         self.status = PendingAck.PENDING
-        self.reason = ""
+        self.reason = ''
 
 
 class SerialCommNode(Node):
-    """
-    ROS 2 node wrapping the reliable serial link to the ESP32.
+    """ROS 2 node wrapping the reliable serial link to the ESP32.
 
     - Two worker threads (reader_thread and heartbeat_thread)
     - Subscribes to:
         - /LEDs (std_msgs/String) -> takes a colour name and sends the LED command
-        - /desliga_hardware (std_msgs/Bool) -> on True, asks the ESP to start a safe shutdown
+        - /desliga_hardware (std_msgs/Bool) -> on True, asks the ESP for a safe shutdown
         - /oled (std_msgs/String) -> takes a message and shows it on the OLED display
-        - /pin_out (std_msgs/String) -> changes an output pin (e.g. "0;high")
+        - /pin_out (std_msgs/String) -> changes an output pin (e.g. '0;high')
 
     - Publishes to:
-        - /button (std_msgs/Int32) -> which button was pressed, on a BUTTON event from the ESP
-        - /LEDs (std_msgs/String) -> publishes "Apagado" when the robot shuts down safely
+        - /button (std_msgs/Int32) -> which button was pressed, on a BUTTON event
+        - /LEDs (std_msgs/String) -> publishes 'Apagado' when the robot shuts down safely
         - /oled (std_msgs/String) -> clears the OLED display on shutdown
-        - /pin_in (std_msgs/String) -> input pin state (e.g. "IN_2;high")
+        - /pin_in (std_msgs/String) -> input pin state (e.g. 'IN_2;high')
     """
 
     def __init__(self):
@@ -150,7 +150,8 @@ class SerialCommNode(Node):
                     maxBytes=LOG_FILE_MAX_BYTES,
                     backupCount=LOG_FILE_BACKUP_COUNT,
                 )
-                handler.setFormatter(logging.Formatter('%(asctime)s [%(levelname)s] %(message)s'))
+                handler.setFormatter(
+                    logging.Formatter('%(asctime)s [%(levelname)s] %(message)s'))
                 self._file_logger.addHandler(handler)
 
         # Serial port and control structures
@@ -158,7 +159,7 @@ class SerialCommNode(Node):
             self.ser = serial.Serial(PORT, BAUD, timeout=1)
         except Exception as e:
             # if the port cannot be opened, log it and re-raise for visibility
-            self.generate_log_msg(f"Failed to open serial port {PORT}: {e}", LogsLevel.error)
+            self.generate_log_msg(f'Failed to open serial port {PORT}: {e}', LogsLevel.error)
             raise
 
         # toggle DTR to reset the microcontroller, so it does not stay in bootloader mode
@@ -168,7 +169,7 @@ class SerialCommNode(Node):
             self.ser.setDTR(True)
         except Exception:
             # not critical; just log it
-            self.generate_log_msg("Failed to toggle DTR", LogsLevel.error)
+            self.generate_log_msg('Failed to toggle DTR', LogsLevel.error)
 
         # msg_id (str) -> PendingAck. Tracks the messages we sent that are still
         # awaiting a reply. The reader thread fills in the status (ACK or NACK) and
@@ -210,10 +211,14 @@ class SerialCommNode(Node):
         self.pinin_pub = self.create_publisher(RosString, 'pin_in', transient_local_qos)
 
         # ROS subscribers
-        self.create_subscription(RosString, 'LEDs', self._led_callback, transient_local_qos)
-        self.create_subscription(RosBool, 'desliga_hardware', self._general_off_sub_callback, volatile_qos)
-        self.create_subscription(RosString, 'oled', self._display_sub_callback, transient_local_qos)
-        self.create_subscription(RosString, 'pin_out', self._pin_out_sub_callback, volatile_qos)
+        self.create_subscription(
+            RosString, 'LEDs', self._led_callback, transient_local_qos)
+        self.create_subscription(
+            RosBool, 'desliga_hardware', self._general_off_sub_callback, volatile_qos)
+        self.create_subscription(
+            RosString, 'oled', self._display_sub_callback, transient_local_qos)
+        self.create_subscription(
+            RosString, 'pin_out', self._pin_out_sub_callback, volatile_qos)
 
         # start the worker threads
         self._reader_thread = threading.Thread(target=self._reader_thread_fn, daemon=True)
@@ -221,44 +226,48 @@ class SerialCommNode(Node):
         self._reader_thread.start()
         self._heartbeat_thread.start()
 
-        self.generate_log_msg(f"serial_comm_node started. port={PORT} baud={BAUD}", LogsLevel.info)
+        self.generate_log_msg(
+            f'serial_comm_node started. port={PORT} baud={BAUD}', LogsLevel.info)
 
     def _reader_thread_fn(self):
-        """Reads lines from the serial port and dispatches ACK/NACK/events/logs."""
+        """Read lines from the serial port and dispatch ACK/NACK/events/logs."""
         while not self._stop_event.is_set():
             try:
                 line = self.ser.readline()
             except Exception as e:
-                self.generate_log_msg(f"Error reading the serial port: {e}", LogsLevel.error)
+                self.generate_log_msg(f'Error reading the serial port: {e}', LogsLevel.error)
                 continue
             if not line:    # readline() returned b'', usually a timeout: nothing to process
                 continue
 
             try:
-                # errors="ignore" drops invalid bytes; strip() removes surrounding
+                # errors='ignore' drops invalid bytes; strip() removes surrounding
                 # whitespace and the trailing \r\n
-                s = line.decode(errors="ignore").strip()
+                s = line.decode(errors='ignore').strip()
             except Exception:
-                self.generate_log_msg(f"Could not decode line: {line}", LogsLevel.error)
+                self.generate_log_msg(f'Could not decode line: {line}', LogsLevel.error)
                 continue
 
             # The ESP sent a MSG to the host: acknowledge it and process it
-            if s.startswith("MSG;"):
+            if s.startswith('MSG;'):
                 # Format: MSG;<id>;REST...
                 # split with maxsplit=2 keeps the command and its arguments together
-                parts = s.split(";", 2)
-                # parts[0] is "MSG", parts[1] is <id>, parts[2] is the command plus arguments
+                parts = s.split(';', 2)
+                # parts[0] is 'MSG', parts[1] is <id>, parts[2] is command plus arguments
 
                 if len(parts) >= 2:
                     msg_id = parts[1]
-                    self.generate_log_msg(f"MSG from the ESP (id={msg_id}) -> {s}", LogsLevel.debug)
+                    self.generate_log_msg(
+                        f'MSG from the ESP (id={msg_id}) -> {s}', LogsLevel.debug)
                     try:
                         # acknowledge reception straight away
-                        self.ser.write(f"ACK;{msg_id}\n".encode())
+                        self.ser.write(f'ACK;{msg_id}\n'.encode())
                         self.ser.flush()
-                        self.generate_log_msg(f"ACK sent to the ESP, id: {msg_id}", LogsLevel.debug)
+                        self.generate_log_msg(
+                            f'ACK sent to the ESP, id: {msg_id}', LogsLevel.debug)
                     except Exception as e:
-                        self.generate_log_msg(f"Error sending the ACK to the ESP: {e}", LogsLevel.error)
+                        self.generate_log_msg(
+                            f'Error sending the ACK to the ESP: {e}', LogsLevel.error)
 
                     # Deduplication: if this id was already processed, the line is a
                     # retransmission caused by an ACK of ours that got lost. The ACK
@@ -267,81 +276,90 @@ class SerialCommNode(Node):
                     # — a single button press would become two BUTTON messages.
                     if msg_id in self._seen_ids:
                         self.generate_log_msg(
-                            f"DUP: MSG id={msg_id} already processed (ESP retransmission); re-acknowledged and ignored",
+                            f'DUP: MSG id={msg_id} already processed (ESP retransmission); '
+                            f're-acknowledged and ignored',
                             LogsLevel.warning)
                         continue
                     self._seen_ids.append(msg_id)
 
                     # Beyond logging, the events are translated into ROS topics:
-                    #   BUTTON -> published on /button (Int32).  Example: MSG;<id>;BUTTON;<n>
+                    #   BUTTON -> published on /button (Int32). Example: MSG;<id>;BUTTON;<n>
                     #   PININ  -> published on /pin_in (String). Example: MSG;<id>;PININ;IN_2;high
-                    part_rest = parts[2] if len(parts) >= 3 else ""
+                    part_rest = parts[2] if len(parts) >= 3 else ''
                     # split the command from its arguments
-                    rest_parts = part_rest.split(";", 1)
+                    rest_parts = part_rest.split(';', 1)
                     if len(rest_parts) >= 1:
                         command = rest_parts[0]
-                        args = rest_parts[1] if len(rest_parts) == 2 else ""
-                        if command == "PININ":
-                            # args: "<pin_name>;<high|low>", e.g. "IN_2;high"
-                            arg_parts = args.split(";", 1)
-                            if len(arg_parts) == 2 and arg_parts[1] in ("high", "low"):
+                        args = rest_parts[1] if len(rest_parts) == 2 else ''
+                        if command == 'PININ':
+                            # args: '<pin_name>;<high|low>', e.g. 'IN_2;high'
+                            arg_parts = args.split(';', 1)
+                            if len(arg_parts) == 2 and arg_parts[1] in ('high', 'low'):
                                 try:
                                     msg_pinin = RosString()
-                                    msg_pinin.data = f"{arg_parts[0]};{arg_parts[1]}"
+                                    msg_pinin.data = f'{arg_parts[0]};{arg_parts[1]}'
                                     self.pinin_pub.publish(msg_pinin)
                                     self.generate_log_msg(
-                                        f"Published on /pin_in: {msg_pinin.data}", LogsLevel.info)
+                                        f'Published on /pin_in: {msg_pinin.data}', LogsLevel.info)
                                 except Exception as e:
-                                    self.generate_log_msg(f"Error publishing on /pin_in: {e}", LogsLevel.error)
+                                    self.generate_log_msg(
+                                        f'Error publishing on /pin_in: {e}', LogsLevel.error)
                             else:
-                                self.generate_log_msg(f"Malformed PININ: {args}", LogsLevel.warning)
+                                self.generate_log_msg(
+                                    f'Malformed PININ: {args}', LogsLevel.warning)
 
-                        if command == "BUTTON":
-                            # args is the button index, e.g. "0" or "1"
-                            arg_parts = args.split(";", 1)
+                        if command == 'BUTTON':
+                            # args is the button index, e.g. '0' or '1'
+                            arg_parts = args.split(';', 1)
                             if len(arg_parts) >= 1 and arg_parts[0].isdigit():
                                 button = int(arg_parts[0])
                                 try:
                                     msg = RosInt32()
                                     if button == 0:   # button that shuts the robot down
                                         msgstr = RosString()
-                                        msgstr.data = "Apagado"
+                                        msgstr.data = 'Apagado'
                                         self.led_pub.publish(msgstr)
-                                        msgstr.data = ";Shutting down.."
+                                        msgstr.data = ';Shutting down..'
                                         self.oled_pub.publish(msgstr)
-                                        self.generate_log_msg("Shutting down with sudo shutdown now...", LogsLevel.info)
-                                        os.system("sudo shutdown now")
+                                        self.generate_log_msg(
+                                            'Shutting down with sudo shutdown now...',
+                                            LogsLevel.info)
+                                        os.system('sudo shutdown now')
                                     else:
-                                        msg.data = button      # publish the index of the pressed button
+                                        msg.data = button   # index of the pressed button
                                         self.button_pub.publish(msg)
-                                        self.generate_log_msg(f"Published on /button: {msg.data}", LogsLevel.info)
+                                        self.generate_log_msg(
+                                            f'Published on /button: {msg.data}', LogsLevel.info)
                                 except Exception as e:
-                                    self.generate_log_msg(f"Error publishing: {e}", LogsLevel.error)
+                                    self.generate_log_msg(
+                                        f'Error publishing: {e}', LogsLevel.error)
                             else:
-                                self.generate_log_msg(f"Malformed BUTTON: {args}", LogsLevel.warning)
+                                self.generate_log_msg(
+                                    f'Malformed BUTTON: {args}', LogsLevel.warning)
 
                     else:
-                        self.generate_log_msg(f"MSG without a command: {s}", LogsLevel.warning)
+                        self.generate_log_msg(f'MSG without a command: {s}', LogsLevel.warning)
                 else:
-                    self.generate_log_msg(f"Malformed MSG from the ESP: {s}", LogsLevel.warning)
+                    self.generate_log_msg(f'Malformed MSG from the ESP: {s}', LogsLevel.warning)
                 continue
 
             # ACK for a message we sent earlier (host -> ESP)
-            if s.startswith("ACK;"):
+            if s.startswith('ACK;'):
                 ack_id = s[4:]
-                self.generate_log_msg(f"ACK received: {ack_id}", LogsLevel.debug)
+                self.generate_log_msg(f'ACK received: {ack_id}', LogsLevel.debug)
                 with self.pending_lock:   # pop under the lock so no other thread reuses the id
                     pending = self.pending_acks.pop(ack_id, None)
-                if pending:  # mark acceptance and wake whoever waits in send_message_with_ack
+                if pending:  # mark acceptance and wake the waiter in send_message_with_ack
                     pending.status = PendingAck.ACK
                     pending.event.set()
-            elif s.startswith("NACK;"):
+            elif s.startswith('NACK;'):
                 # format: NACK;<id>;REASON  (maxsplit=2 keeps a REASON containing ';' intact)
-                parts = s.split(";", 2)
+                parts = s.split(';', 2)
                 if len(parts) >= 3:
                     nack_id = parts[1]
                     reason = parts[2]
-                    self.generate_log_msg(f"NACK received id={nack_id} reason={reason}", LogsLevel.warning)
+                    self.generate_log_msg(
+                        f'NACK received id={nack_id} reason={reason}', LogsLevel.warning)
                     with self.pending_lock:
                         pending = self.pending_acks.pop(nack_id, None)
                     if pending:
@@ -357,23 +375,24 @@ class SerialCommNode(Node):
                         # accepted and then dropped — we log it explicitly so the case
                         # does not go unnoticed.
                         self.generate_log_msg(
-                            f"NACK id={nack_id} arrived after the ACK: command dropped by the firmware ({reason})",
+                            f'NACK id={nack_id} arrived after the ACK: command dropped '
+                            f'by the firmware ({reason})',
                             LogsLevel.warning)
                 else:
-                    self.generate_log_msg(f"Malformed NACK: {s}", LogsLevel.warning)
+                    self.generate_log_msg(f'Malformed NACK: {s}', LogsLevel.warning)
             else:
                 # any other line is diagnostic output from the ESP
-                self.generate_log_msg(f"Host received -> {s}", LogsLevel.debug)
+                self.generate_log_msg(f'Host received -> {s}', LogsLevel.debug)
 
     def _heartbeat_thread_fn(self):
-        """Sends PING every HEARTBEAT_INTERVAL seconds."""
+        """Send PING every HEARTBEAT_INTERVAL seconds."""
         while not self._stop_event.is_set():
             try:
-                self.ser.write(b"PING\n")
+                self.ser.write(b'PING\n')
                 self.ser.flush()   # force an immediate send
-                self.generate_log_msg("PING sent", LogsLevel.debug)
+                self.generate_log_msg('PING sent', LogsLevel.debug)
             except Exception as e:
-                self.generate_log_msg(f"Error sending PING: {e}", LogsLevel.error)
+                self.generate_log_msg(f'Error sending PING: {e}', LogsLevel.error)
             # short sleeps so shutdown stays responsive
             for _ in range(int(HEARTBEAT_INTERVAL * 10)):
                 if self._stop_event.is_set():
@@ -381,7 +400,7 @@ class SerialCommNode(Node):
                 time.sleep(0.1)
 
     def _generate_msg_id(self):
-        """Returns the next message id (incrementing counter)."""
+        """Return the next message id (incrementing counter)."""
         global idCont
         idCont = idCont + 1
         if idCont >= 4294967295:
@@ -389,7 +408,7 @@ class SerialCommNode(Node):
         return idCont
 
     def generate_log_msg(self, msg, log_type):
-        """Emits a log message honouring the LOG_LEVEL hierarchy.
+        """Emit a log message honouring the LOG_LEVEL hierarchy.
 
         Default sink: the rclpy logger (console and /rosout). If LOG_FILE is set,
         the same message also goes to the rotating file.
@@ -412,10 +431,11 @@ class SerialCommNode(Node):
         if self._file_logger:
             self._file_logger.log(STD_LEVEL[log_type], msg)
 
-    def send_message_with_ack(self, command_payload, retries=DEFAULT_RETRIES, timeout=ACK_TIMEOUT):
-        """
-        Sends a payload (e.g. "DISPLAY;Battery:100%") as MSG;<id>;<command_payload>\n
-        and waits for ACK;<id>, retransmitting up to `retries` times.
+    def send_message_with_ack(self, command_payload, retries=DEFAULT_RETRIES,
+                              timeout=ACK_TIMEOUT):
+        r"""Send a payload as MSG;<id>;<command_payload>\n and wait for ACK;<id>.
+
+        Retransmits up to `retries` times.
 
         Returns True only if the message was confirmed with an ACK. A NACK (an
         explicit rejection from the firmware, e.g. NO_BUFFER) returns False and is
@@ -424,9 +444,10 @@ class SerialCommNode(Node):
         This is the same rule the firmware's send_msg_with_ack_esp follows.
         """
         msg_id = str(self._generate_msg_id())
-        full = f"MSG;{msg_id};{command_payload}\n"
+        full = f'MSG;{msg_id};{command_payload}\n'
         self.generate_log_msg(
-            f"Sending msg id={msg_id} payload={command_payload} retries={retries} timeout={timeout}",
+            f'Sending msg id={msg_id} payload={command_payload} '
+            f'retries={retries} timeout={timeout}',
             LogsLevel.debug)
         pending = PendingAck()  # carries the wait Event and the reply status
         with self.pending_lock:
@@ -440,9 +461,11 @@ class SerialCommNode(Node):
             try:
                 self.ser.write(full.encode())
                 self.ser.flush()   # force an immediate send
-                self.generate_log_msg(f"Attempt {attempt} sent: {full.strip()}", LogsLevel.debug)
+                self.generate_log_msg(
+                    f'Attempt {attempt} sent: {full.strip()}', LogsLevel.debug)
             except Exception as e:
-                self.generate_log_msg(f"Error writing to the serial port: {e}", LogsLevel.error)
+                self.generate_log_msg(
+                    f'Error writing to the serial port: {e}', LogsLevel.error)
                 break
 
             # Wait for the reader thread to signal the Event (on ACK;<id> or
@@ -450,21 +473,24 @@ class SerialCommNode(Node):
             answered = pending.event.wait(timeout)
 
             if answered and pending.status == PendingAck.ACK:
-                self.generate_log_msg(f"ACK confirmed for id={msg_id} on attempt {attempt}", LogsLevel.debug)
+                self.generate_log_msg(
+                    f'ACK confirmed for id={msg_id} on attempt {attempt}', LogsLevel.debug)
                 success = True
                 break
 
             if answered and pending.status == PendingAck.NACK:
                 # explicit rejection: do not retransmit (see the docstring)
                 self.generate_log_msg(
-                    f"NACK for id={msg_id} (reason={pending.reason}) on attempt {attempt}: message refused, not retransmitting",
+                    f'NACK for id={msg_id} (reason={pending.reason}) on attempt {attempt}: '
+                    f'message refused, not retransmitting',
                     LogsLevel.warning)
                 success = False
                 break
 
             # timeout: no reply arrived within the deadline
             self.generate_log_msg(
-                f"Timeout waiting for ACK id={msg_id} (attempt {attempt}/{retries})", LogsLevel.warning)
+                f'Timeout waiting for ACK id={msg_id} (attempt {attempt}/{retries})',
+                LogsLevel.warning)
             with self.pending_lock:
                 self.pending_acks.pop(msg_id, None)   # clear the stale entry
             # If attempts remain, register a fresh entry. This prevents an old Event,
@@ -481,121 +507,154 @@ class SerialCommNode(Node):
 
         return success
 
-    def set_led(self, color="Branco", retries=DEFAULT_RETRIES, timeout=ACK_TIMEOUT):
+    def set_led(self, color='Branco', retries=DEFAULT_RETRIES, timeout=ACK_TIMEOUT):
+        """Set the LED strip to a colour by name.
+
+        The names are protocol values kept in the original language: Branco (white),
+        Laranja (orange), Amarelo (yellow), Azul (blue), Verde (green), Roxo (purple),
+        Ciano (cyan), Vermelho (red). Any other value turns the strip off.
         """
-        Sets the LED strip to a colour by name. The names are protocol values kept in
-        the original language: Branco (white), Laranja (orange), Amarelo (yellow),
-        Azul (blue), Verde (green), Roxo (purple), Ciano (cyan), Vermelho (red).
-        Any other value turns the strip off.
-        """
-        payload = f"LED;{color}"
+        payload = f'LED;{color}'
         return self.send_message_with_ack(payload, retries=retries, timeout=timeout)
 
     def display_text(self, text, retries=DEFAULT_RETRIES, timeout=ACK_TIMEOUT):
-        """
-        Shows text on the OLED, as "<line_1>;<line_2>".
+        """Show text on the OLED, as '<line_1>;<line_2>'.
+
         Note: avoid very long strings without adjusting the firmware first.
         """
-        payload = f"DISPLAY;{text}"
+        payload = f'DISPLAY;{text}'
         return self.send_message_with_ack(payload, retries=retries, timeout=timeout)
 
     def set_pin_out(self, text, retries=DEFAULT_RETRIES, timeout=ACK_TIMEOUT):
-        """
-        Asks the microcontroller to change the state of an output GPIO.
+        """Ask the microcontroller to change the state of an output GPIO.
+
         Note: the value sent is NOT the physical GPIO number; it is a zero-based
         index into the firmware's PINS_OUT[] array.
         """
-        payload = f"PINOUT;{text}"
+        payload = f'PINOUT;{text}'
         return self.send_message_with_ack(payload, retries=retries, timeout=timeout)
 
     # ROS subscriber callback for /LEDs
     def _led_callback(self, ros_msg):
-        """Called when a message arrives on /LEDs (std_msgs/String)."""
-        self.generate_log_msg(f"Received on /LEDs: {ros_msg.data}", LogsLevel.debug)
+        """Handle a message arriving on /LEDs (std_msgs/String)."""
+        self.generate_log_msg(f'Received on /LEDs: {ros_msg.data}', LogsLevel.debug)
         try:
             ok = self.set_led(ros_msg.data, retries=DEFAULT_RETRIES, timeout=ACK_TIMEOUT)
             if ok:
-                self.generate_log_msg(f"LED command sent and acknowledged for colour {ros_msg.data}", LogsLevel.debug)
+                self.generate_log_msg(
+                    f'LED command sent and acknowledged for colour {ros_msg.data}',
+                    LogsLevel.debug)
             else:
-                self.generate_log_msg(f"LED command sent BUT not acknowledged for colour {ros_msg.data}", LogsLevel.warning)
+                self.generate_log_msg(
+                    f'LED command sent BUT not acknowledged for colour {ros_msg.data}',
+                    LogsLevel.warning)
         except Exception as e:
-            self.generate_log_msg(f"Error {e} while sending the LED command: {ros_msg.data}", LogsLevel.error)
+            self.generate_log_msg(
+                f'Error {e} while sending the LED command: {ros_msg.data}', LogsLevel.error)
 
     # ROS subscriber callback for /desliga_hardware
     def _general_off_sub_callback(self, ros_msg):
-        """Called when a message arrives on /desliga_hardware (std_msgs/Bool)."""
-        self.generate_log_msg(f"Received on /desliga_hardware: {ros_msg.data}", LogsLevel.info)
+        """Handle a message arriving on /desliga_hardware (std_msgs/Bool)."""
+        self.generate_log_msg(
+            f'Received on /desliga_hardware: {ros_msg.data}', LogsLevel.info)
         if ros_msg.data:
             try:
-                ok = self.send_message_with_ack("POWER_OFF", retries=DEFAULT_RETRIES, timeout=ACK_TIMEOUT)
+                ok = self.send_message_with_ack(
+                    'POWER_OFF', retries=DEFAULT_RETRIES, timeout=ACK_TIMEOUT)
                 if ok:
-                    self.generate_log_msg("POWER_OFF command sent and acknowledged.", LogsLevel.debug)
+                    self.generate_log_msg(
+                        'POWER_OFF command sent and acknowledged.', LogsLevel.debug)
                 else:
-                    self.generate_log_msg("POWER_OFF command sent BUT not acknowledged.", LogsLevel.warning)
+                    self.generate_log_msg(
+                        'POWER_OFF command sent BUT not acknowledged.', LogsLevel.warning)
             except Exception as e:
-                self.generate_log_msg(f"Error sending the POWER_OFF command: {e}", LogsLevel.error)
+                self.generate_log_msg(
+                    f'Error sending the POWER_OFF command: {e}', LogsLevel.error)
 
     # ROS subscriber callback for /oled
     def _display_sub_callback(self, ros_msg):
-        """Called when a message arrives on /oled (std_msgs/String)."""
-        self.generate_log_msg(f"Received on /oled: {ros_msg.data}", LogsLevel.debug)
+        """Handle a message arriving on /oled (std_msgs/String)."""
+        self.generate_log_msg(f'Received on /oled: {ros_msg.data}', LogsLevel.debug)
         try:
             ok = self.display_text(ros_msg.data, retries=DEFAULT_RETRIES, timeout=ACK_TIMEOUT)
             if ok:
-                self.generate_log_msg(f"DISPLAY command sent and acknowledged for message {ros_msg.data}", LogsLevel.debug)
+                self.generate_log_msg(
+                    f'DISPLAY command sent and acknowledged for message {ros_msg.data}',
+                    LogsLevel.debug)
             else:
-                self.generate_log_msg(f"DISPLAY command sent BUT not acknowledged for message {ros_msg.data}", LogsLevel.warning)
+                self.generate_log_msg(
+                    f'DISPLAY command sent BUT not acknowledged for message {ros_msg.data}',
+                    LogsLevel.warning)
         except Exception as e:
-            self.generate_log_msg(f"Error sending the DISPLAY command: {e}", LogsLevel.error)
+            self.generate_log_msg(
+                f'Error sending the DISPLAY command: {e}', LogsLevel.error)
 
     # ROS subscriber callback for /pin_out
     def _pin_out_sub_callback(self, ros_msg):
-        """Called when a message arrives on /pin_out (std_msgs/String).
+        """Handle a message arriving on /pin_out (std_msgs/String).
 
-        The payload looks like "0;high" or "1;low": a zero-based index into the
+        The payload looks like '0;high' or '1;low': a zero-based index into the
         firmware's PINS_OUT[] array, not a physical GPIO number.
         """
-        self.generate_log_msg(f"Received on /pin_out: {ros_msg.data}", LogsLevel.debug)
+        self.generate_log_msg(f'Received on /pin_out: {ros_msg.data}', LogsLevel.debug)
         try:
             ok = self.set_pin_out(ros_msg.data, retries=DEFAULT_RETRIES, timeout=ACK_TIMEOUT)
             if ok:
-                self.generate_log_msg(f"PINOUT command sent and acknowledged for message {ros_msg.data}", LogsLevel.debug)
+                self.generate_log_msg(
+                    f'PINOUT command sent and acknowledged for message {ros_msg.data}',
+                    LogsLevel.debug)
             else:
-                self.generate_log_msg(f"PINOUT command sent BUT not acknowledged for message {ros_msg.data}", LogsLevel.warning)
+                self.generate_log_msg(
+                    f'PINOUT command sent BUT not acknowledged for message {ros_msg.data}',
+                    LogsLevel.warning)
         except Exception as e:
-            self.generate_log_msg(f"Error sending the PINOUT command: {e}", LogsLevel.error)
+            self.generate_log_msg(
+                f'Error sending the PINOUT command: {e}', LogsLevel.error)
 
     # graceful shutdown
     def destroy(self):
+        """Release the hardware, stop the worker threads and destroy the node."""
         # release the coupling (PINOUT_0)
         try:
-            ok = self.set_pin_out("0;high", retries=DEFAULT_RETRIES, timeout=ACK_TIMEOUT)
+            ok = self.set_pin_out('0;high', retries=DEFAULT_RETRIES, timeout=ACK_TIMEOUT)
             if ok:
-                self.generate_log_msg("PINOUT command (release coupling) sent and acknowledged.", LogsLevel.debug)
+                self.generate_log_msg(
+                    'PINOUT command (release coupling) sent and acknowledged.',
+                    LogsLevel.debug)
             else:
-                self.generate_log_msg("PINOUT command (release coupling) sent BUT not acknowledged.", LogsLevel.warning)
+                self.generate_log_msg(
+                    'PINOUT command (release coupling) sent BUT not acknowledged.',
+                    LogsLevel.warning)
         except Exception as e:
-            self.generate_log_msg(f"Error sending the PINOUT command (release coupling): {e}", LogsLevel.error)
+            self.generate_log_msg(
+                f'Error sending the PINOUT command (release coupling): {e}', LogsLevel.error)
 
         # turn the LED strip off
         try:
-            ok = self.set_led("Apagar", retries=DEFAULT_RETRIES, timeout=ACK_TIMEOUT)
+            ok = self.set_led('Apagar', retries=DEFAULT_RETRIES, timeout=ACK_TIMEOUT)
             if ok:
-                self.generate_log_msg("LED command sent and acknowledged (strip off).", LogsLevel.debug)
+                self.generate_log_msg(
+                    'LED command sent and acknowledged (strip off).', LogsLevel.debug)
             else:
-                self.generate_log_msg("LED command sent BUT not acknowledged (strip off).", LogsLevel.info)
+                self.generate_log_msg(
+                    'LED command sent BUT not acknowledged (strip off).', LogsLevel.info)
         except Exception as e:
-            self.generate_log_msg(f"Error sending the LED command (strip off): {e}", LogsLevel.error)
+            self.generate_log_msg(
+                f'Error sending the LED command (strip off): {e}', LogsLevel.error)
 
         # clear the display
         try:
-            ok = self.display_text(" ;Shutting down..", retries=DEFAULT_RETRIES, timeout=ACK_TIMEOUT)
+            ok = self.display_text(' ;Shutting down..', retries=DEFAULT_RETRIES,
+                                   timeout=ACK_TIMEOUT)
             if ok:
-                self.generate_log_msg("DISPLAY clear command sent and acknowledged.", LogsLevel.debug)
+                self.generate_log_msg(
+                    'DISPLAY clear command sent and acknowledged.', LogsLevel.debug)
             else:
-                self.generate_log_msg("DISPLAY clear command sent BUT not acknowledged.", LogsLevel.warning)
+                self.generate_log_msg(
+                    'DISPLAY clear command sent BUT not acknowledged.', LogsLevel.warning)
         except Exception as e:
-            self.generate_log_msg(f"Error sending the DISPLAY command: {e}", LogsLevel.error)
+            self.generate_log_msg(
+                f'Error sending the DISPLAY command: {e}', LogsLevel.error)
 
         # tell the worker threads to stop
         self._stop_event.set()
@@ -614,10 +673,11 @@ class SerialCommNode(Node):
             super().destroy_node()
         except Exception:
             pass
-        self.generate_log_msg("serial_comm_node finished", LogsLevel.info)
+        self.generate_log_msg('serial_comm_node finished', LogsLevel.info)
 
 
 def main(args=None):
+    """Start the node and spin until interrupted."""
     rclpy.init(args=args)
     node = None
     try:
@@ -625,7 +685,8 @@ def main(args=None):
         rclpy.spin(node)
     except KeyboardInterrupt:
         if node:
-            node.generate_log_msg("KeyboardInterrupt received, shutting down...", LogsLevel.info)
+            node.generate_log_msg(
+                'KeyboardInterrupt received, shutting down...', LogsLevel.info)
     finally:
         try:
             if node:

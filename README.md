@@ -349,6 +349,31 @@ MSG;3;PINOUT;0;high
 
 The firmware replies `ACK;1`, `EXEC_OK:DISPLAY:Hello;ROS 2` and so on. Note that without the `PING`s the watchdog trips the emergency stop after 1 second — that is the expected behaviour.
 
+### Running the tests
+
+The protocol guarantees claimed above are covered by a test suite that needs **no hardware and no ROS installation** — missing modules are stubbed, so it also runs in a bare CI container:
+
+```bash
+cd comunication_serial
+pytest test/test_protocol.py -v
+```
+
+Nine cases exercise the real `send_message_with_ack()` and `_reader_thread_fn()`:
+
+| Test | What it pins down |
+| --- | --- |
+| `test_ack_returns_true_after_a_single_transmission` | The happy path does not retransmit. |
+| `test_nack_returns_false_and_is_not_retransmitted` | A NACK returns failure and returns *immediately*, without waiting out the timeout. |
+| `test_timeout_exhausts_every_attempt` | Three transmissions before giving up. |
+| `test_ack_on_the_last_attempt_still_succeeds` | A late ACK is still honoured. |
+| `test_pending_table_is_left_clean` | No leaked entries in `pending_acks`. |
+| `test_duplicate_button_is_published_once_and_acked_twice` | Exactly-once delivery: one publish, **two** ACKs. |
+| `test_distinct_ids_are_both_published` | Deduplication does not swallow legitimate messages. |
+| `test_duplicate_pinin_is_published_once` | Same guarantee for `PININ` events. |
+| `test_id_reused_after_the_window_expires_is_treated_as_new` | The documented limit of the 16-id window. |
+
+Under a full ROS 2 workspace they also run through `colcon test --packages-select comunication_serial`, alongside the standard `ament` lint checks.
+
 ## Adapting it to your hardware
 
 The protocol is not coupled to this project's robot. To move it to another one:

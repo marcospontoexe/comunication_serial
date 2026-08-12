@@ -4,7 +4,7 @@
   <name>comunication_serial</name>
   <version>0.0.0</version>
   <description>Reliable serial bridge between ROS 2 and an ESP32</description>
-  <maintainer email="TODO: your@email">TODO: your name</maintainer>
+  <maintainer email="marcos.daniel1990@hotmail.com">Marcos Daniel Santana</maintainer>
   <license>MIT</license>
 
   <depend>rclpy</depend>

@@ -1,6 +1,7 @@
-from setuptools import find_packages, setup
-import os
 from glob import glob
+import os
+
+from setuptools import find_packages, setup
 
 package_name = 'comunication_serial'
 
@@ -16,8 +17,8 @@ setup(
     ],
     install_requires=['setuptools'],
     zip_safe=True,
-    maintainer='TODO: your name',
-    maintainer_email='TODO: your@email',
+    maintainer='Marcos Daniel Santana',
+    maintainer_email='marcos.daniel1990@hotmail.com',
     description='Reliable serial bridge between ROS 2 and an ESP32',
     license='MIT',
     extras_require={
