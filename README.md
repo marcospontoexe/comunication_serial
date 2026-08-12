@@ -4,10 +4,7 @@ A lightweight alternative to **micro-ROS** and **rosserial** for connecting micr
 
 This is not an ad-hoc serial parser: it is a line protocol with explicit guarantees, built for a mobile robot in continuous operation, where losing a message means leaving an actuator in the wrong state.
 
-```
-ESP32 (FreeRTOS, C++)  <--- USB / UART 115200 --->  ROS 2 node (rclpy)  <--- RMW ---> ROS 2 graph
-   GPIOs, LEDs, OLED         MSG/ACK protocol         publishers/subscribers      (any DDS or Zenoh)
-```
+![Architecture diagram: ESP32 FreeRTOS firmware and ROS 2 rclpy node connected over a UART link, showing tasks, threads, shared state and topics on each side](./docs/architecture-diagram.png)
 
 ---
 
@@ -17,6 +14,7 @@ ESP32 (FreeRTOS, C++)  <--- USB / UART 115200 --->  ROS 2 node (rclpy)  <--- RMW
 - [How it compares to the alternatives](#how-it-compares-to-the-alternatives)
 - [What sets it apart from a plain serial parser](#what-sets-it-apart-from-a-plain-serial-parser)
 - [Protocol](#protocol)
+- [Architecture at a glance](#architecture-at-a-glance)
 - [Firmware architecture](#firmware-architecture)
 - [ROS 2 node architecture](#ros-2-node-architecture)
 - [Installation and usage](#installation-and-usage)
@@ -29,7 +27,9 @@ ESP32 (FreeRTOS, C++)  <--- USB / UART 115200 --->  ROS 2 node (rclpy)  <--- RMW
 
 ## Why this project exists
 
-When you need to connect a microcontroller to ROS 2, the usual options are:
+The robot behind this project runs **Zenoh** (`rmw_zenoh_cpp`) as its RMW, not Fast DDS or Cyclone DDS. That fact alone ruled out the obvious answer: **micro-ROS does not support Zenoh**. Its agent-based bridge (Micro XRCE-DDS) is built and maintained around Fast DDS and, to a lesser extent, Cyclone DDS — there is no supported path to plug a micro-ROS Agent straight into a Zenoh-based graph. So before any trade-off comparison, the field was already narrowed to whatever could sit on plain serial and talk to the ROS graph through an ordinary node, which is what a bridge node in `rclpy` does regardless of which RMW it is compiled against.
+
+More generally, when you need to connect a microcontroller to ROS 2, the usual options are:
 
 **micro-ROS** is the official and most complete solution: the MCU becomes a real ROS 2 node, with standard message types and QoS. The cost is the stack: the firmware embeds a **Micro XRCE-DDS** client, and you must keep a separate process — the **micro-ROS Agent** — running on the computer to bridge into the ROS 2 graph. On flash-constrained MCUs (a 2 MB ESP32, for instance) that weighs, and the Agent is one more piece to start, monitor and restart in the system lifecycle.
 
@@ -58,7 +58,7 @@ This project is the fourth option — a **custom serial bridge** — taken serio
 
 **On middleware:** the bridge node is an ordinary ROS 2 node written in `rclpy`. It inherits the system's `RMW_IMPLEMENTATION` — Fast DDS, Cyclone DDS or **Zenoh** (`rmw_zenoh_cpp`) — with no extra configuration and without the firmware ever knowing about it. That is the same property the micro-ROS Agent provides, minus the intermediate process.
 
-**Where the other options win:** if you need standard ROS message types generated on the MCU itself, end-to-end negotiated QoS, or several MCUs announcing themselves dynamically on the network, **use micro-ROS** — that is what it exists for. If you are targeting wireless with minimal overhead and accept a more involved MCU setup, look at **zenoh-pico**, today's most modern architecture, which drops the Agent entirely. This project fills a specific niche: **a point-to-point serial link, with a safety requirement and a minimal footprint**.
+**Where the other options win:** if you need standard ROS message types generated on the MCU itself, end-to-end negotiated QoS, or several MCUs announcing themselves dynamically on the network, **use micro-ROS** — that is what it exists for, *provided your graph runs on Fast DDS or Cyclone DDS*. If your RMW is Zenoh, that option is off the table today; **zenoh-pico** is the closer architectural match if you can take on a more involved MCU setup, since it drops the Agent entirely. This project fills a specific niche: **a point-to-point serial link, with a safety requirement and a minimal footprint**, that does not care which RMW sits behind the bridge node.
 
 > ⚠️ **No published benchmarks.** The differences above are structural (number of processes, protocol layers, reading model), not measurements. I have not run a latency comparison against micro-ROS. If you measure one, open an issue — it is the most useful contribution this repository can receive.
 
@@ -146,6 +146,56 @@ Non-protocol lines, recorded as logs by the node:
 | Debounce | 50 ms | `DEBOUNCE_DELAY_MS` |
 
 The margin between the PING and the timeout is **one cycle**: two consecutive lost PINGs trigger the stop. Tighten or loosen it according to your risk profile.
+
+## Architecture at a glance
+
+Which task or thread owns which piece of state, and what actually travels on the wire:
+
+```mermaid
+flowchart LR
+    subgraph ESP["ESP32 firmware — FreeRTOS, dual-core"]
+        direction TB
+        BTN["buttonTask<br/>Core 0 · prio 1<br/>debounce → BUTTON / PININ"]
+        subgraph CORE1["Core 1"]
+            direction TB
+            SER["serialTask · prio 3<br/>UART RX, instant ACK,<br/>dedup check, enqueue"]
+            HB["heartbeatTask · prio 1<br/>watchdog: PING gap over 1s<br/>drives CONTROL_STOP"]
+            LEDT["ledStripTask · prio 2<br/>NeoPixel strip"]
+            LOOP["loop() — Arduino main<br/>dequeue rxQueue,<br/>handle_MSG_command()"]
+            SER -->|rxQueue| LOOP
+        end
+        STATE["shared state<br/>serialMutex · rxQueue/freeQueue x10<br/>pendingAcks x10 · seenIds x16"]
+        BTN -.-> STATE
+        SER -.-> STATE
+        HB -.-> STATE
+        LOOP -.-> STATE
+    end
+
+    UART{{"UART, 115200 baud<br/>MSG;id;CMD;ARGS both ways<br/>ACK;id / NACK;id;REASON both ways<br/>PING, ROS to ESP only, no ack"}}
+
+    subgraph NODE["ROS 2 node — rclpy, SerialCommNode"]
+        direction TB
+        RD["reader_thread<br/>ACK/NACK dispatch,<br/>dedup check, publish"]
+        HBT["heartbeat_thread<br/>PING every 0.5s"]
+        MAIN["main thread — rclpy.spin()<br/>subscriber callbacks call<br/>send_message_with_ack()"]
+        RSTATE["shared state<br/>pending_acks dict + lock<br/>_seen_ids deque x16"]
+        RD -.-> RSTATE
+        HBT -.-> RSTATE
+        MAIN -.-> RSTATE
+    end
+
+    PUB["publishes<br/>/button Int32 · /LEDs String<br/>/oled String · /pin_in String"]
+    SUB["subscribes<br/>/LEDs · /desliga_hardware<br/>/oled · /pin_out"]
+
+    ESP <--> UART
+    UART <--> NODE
+    RD --> PUB
+    SUB --> MAIN
+    PUB --> GRAPH(["rest of the ROS 2 graph"])
+    GRAPH --> SUB
+```
+
+Solid arrows are direct calls or message flow; dotted arrows mean "reads or writes this shared state". The two dedup windows (`seenIds` on the firmware, `_seen_ids` on the node) are what make a retransmitted message safe to re-acknowledge without re-executing it — see [exactly-once delivery](#what-sets-it-apart-from-a-plain-serial-parser) above.
 
 ## Firmware architecture
 
