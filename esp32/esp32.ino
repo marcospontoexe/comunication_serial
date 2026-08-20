@@ -86,6 +86,13 @@ const int MONITOR_PINS[] = {IN_2};
 const int MONITOR_COUNT = sizeof(MONITOR_PINS) / sizeof(MONITOR_PINS[0]);
 // Literal names of the #defines matching each pin (used in the payload)
 const char* const MONITOR_PIN_NAMES[] = {STRINGIFY(IN_2)};
+
+// Buffer size for a "PININ;<name>;<high|low>" payload:
+//   "PININ;" (6) + name + ";" (1) + "high" (4) + '\0' (1)  =  12 + strlen(name)
+// 48 leaves room for a 36-character #define name. If you add a pin whose name is
+// longer than that, build_pinin_payload() reports it instead of silently sending a
+// truncated, malformed frame.
+const size_t PININ_PAYLOAD_LEN = 48;
 // ##############################################################
 
 
@@ -191,6 +198,8 @@ static void signal_pending_ack(unsigned long id, int status);
 // deduplication of received ids
 static bool id_already_processed(unsigned long id);
 static void register_seen_id(unsigned long id);
+// PININ payload assembly (guards against a pin name too long for the buffer)
+static bool build_pinin_payload(char *out, size_t out_len, const char *pin_name, int state);
 
 // serialised writes to the UART (see serialMutex)
 void serialSendLine(const char *line);
@@ -220,8 +229,13 @@ void serialSendLine(const char *line) {
 }
 
 void serialSendLinef(const char *fmt, ...) {
-  // static buffer: keeps pressure off the task stacks (heartbeatTask and
-  // ledStripTask have little headroom) and access is already serialised by the mutex.
+  // Static buffer: keeps the 256-byte line off the caller's stack, and access is
+  // already serialised by the mutex.
+  //
+  // It does NOT make this function cheap on stack. vsnprintf() below is newlib's
+  // full formatter and needs roughly 1.3 KB of stack on its own — far more than the
+  // buffer this static allocation saves. Any task that reaches this function must be
+  // created with at least 4096 bytes; see the sizing note in setup().
   static char lineOutBuf[RX_LINE_MAX_LEN];
   if (serialMutex) xSemaphoreTake(serialMutex, portMAX_DELAY);
   va_list ap;
@@ -341,17 +355,23 @@ void setup() {
   // create the tasks
   // xTaskCreatePinnedToCore creates a FreeRTOS task and pins it to one of the two
   // ESP32 cores. loop() runs on core 1, and the peripherals are pushed to core 0.
-  xTaskCreatePinnedToCore(serialTask, "serialTask", 2048, NULL, 3, &serialTaskHandle, 1);
+  // Sizing note: any task that reaches serialSendLinef() pays for newlib's
+  // vsnprintf(), which needs roughly 1.3 KB of stack on its own. Give such a task
+  // 4096 bytes — below that it overruns the stack canary and the core panics.
+  xTaskCreatePinnedToCore(serialTask, "serialTask", 4096, NULL, 3, &serialTaskHandle, 1);
   // serialTask: pointer to the task function.
   // "serialTask": descriptive name.
-  // 2048: stack size in BYTES (in the ESP-IDF FreeRTOS port this parameter is in
+  // 4096: stack size in BYTES (in the ESP-IDF FreeRTOS port this parameter is in
   //       bytes, unlike vanilla FreeRTOS, which uses words).
   // 3: task priority (higher means more important).
   // &serialTaskHandle: handle used later to inspect or control the task.
   // 1: core the task runs on (0 -> core 0, 1 -> core 1, tskNO_AFFINITY -> either).
 
-  xTaskCreatePinnedToCore(heartbeatTask, "heartbeatTask", 1536, NULL, 1, &heartbeatTaskHandle, 1);
+  // 4096: calls set_logical_gpio() -> serialSendLinef() -> vsnprintf() when the
+  //       watchdog trips, which is precisely the path that must not crash.
+  xTaskCreatePinnedToCore(heartbeatTask, "heartbeatTask", 4096, NULL, 1, &heartbeatTaskHandle, 1);
   xTaskCreatePinnedToCore(buttonTask, "buttonTask", 3072, NULL, 1, &buttonTaskHandle, 0);
+  // 1536 is enough here: ledStripTask only drives pixels, it never formats text.
   xTaskCreatePinnedToCore(ledStripTask, "ledStripTask", 1536, NULL, 2, &ledStripTaskHandle, 1);
 
   // initialise the heartbeat timestamp
@@ -584,6 +604,28 @@ static void register_seen_id(unsigned long id) {
 }
 
 
+// ---------------- PININ payload assembly ----------------
+/**
+   build_pinin_payload - assembles "PININ;<name>;<high|low>" into out.
+
+   snprintf() truncates silently when the buffer is too small, which would put a
+   malformed frame on the wire: the host would parse "PININ;IN_LONG_NAM" with no
+   state field and drop it as malformed, so a real pin transition would be lost
+   with nothing pointing at the cause. Checking the return value turns that into an
+   explicit diagnostic line instead.
+
+   @return true if the payload was assembled in full; false if the name did not fit.
+*/
+static bool build_pinin_payload(char *out, size_t out_len, const char *pin_name, int state) {
+  int n = snprintf(out, out_len, "PININ;%s;%s", pin_name, state == HIGH ? "high" : "low");
+  if (n < 0 || (size_t)n >= out_len) {
+    // n is what snprintf WOULD have written, so n >= out_len means it was truncated
+    serialSendLinef("ERROR:PININ_NAME_TOO_LONG:%s", pin_name);
+    return false;
+  }
+  return true;
+}
+
 // ---------------- Send with ACK ----------------
 bool send_msg_with_ack_esp(const char *payload, int retries, unsigned long timeout_ms) {
   unsigned long id = generate_msg_id();
@@ -662,9 +704,10 @@ void buttonTask(void *pvParameters) {
   // host never has to assume a starting value.
   for (int i = 0; i < MONITOR_COUNT; ++i) {
     int state = digitalRead(MONITOR_PINS[i]);
-    char payload[20];
-    snprintf(payload, sizeof(payload), "PININ;%s;%s",
-             MONITOR_PIN_NAMES[i], state == HIGH ? "high" : "low");
+    char payload[PININ_PAYLOAD_LEN];
+    if (!build_pinin_payload(payload, sizeof(payload), MONITOR_PIN_NAMES[i], state)) {
+      continue;   // name too long: already reported, do not send a malformed frame
+    }
     serialSendLine(payload);
 
     bool ok = send_msg_with_ack_esp(payload, 3, 1000);
@@ -757,18 +800,20 @@ void buttonTask(void *pvParameters) {
           // If the stabilised reading differs from the last confirmed state,
           // we have a real transition.
           if (last_read_mon[i] != last_steady_mon[i]) {
-            char payload[20];
-            snprintf(payload, sizeof(payload), "PININ;%s;%s", MONITOR_PIN_NAMES[i], state == HIGH ? "high" : "low");
-            serialSendLine(payload);
+            char payload[PININ_PAYLOAD_LEN];
+            if (build_pinin_payload(payload, sizeof(payload), MONITOR_PIN_NAMES[i], state)) {
+              serialSendLine(payload);
 
-            bool ok = send_msg_with_ack_esp(payload, 3, 1000);
-            if (ok) {
-              serialSendLine("PININ: ACK received from the host");
-            } else {
-              serialSendLine("PININ: no ACK from the host (timeout)");
+              bool ok = send_msg_with_ack_esp(payload, 3, 1000);
+              if (ok) {
+                serialSendLine("PININ: ACK received from the host");
+              } else {
+                serialSendLine("PININ: no ACK from the host (timeout)");
+              }
             }
-
-            // update the steady state to avoid repeated triggers
+            // The steady state is updated either way: if the name does not fit, the
+            // problem is the #define, not the pin, and retrying every 100 ms would
+            // only flood the link with the same error line.
             last_steady_mon[i] = last_read_mon[i];
           }
         }

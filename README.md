@@ -369,6 +369,63 @@ Would rather not use udev? Just change `PORT` at the top of [communicator_serial
 PORT = "/dev/ttyUSB0"
 ```
 
+### Passwordless `shutdown` for the power button
+
+Button 0 is the hardware power button. When it is pressed, the firmware sends
+`BUTTON;0` and the node shuts the host computer down before the ESP32 cuts the
+power rail — so the filesystem is unmounted cleanly instead of losing power
+mid-write. That is done in [communicator_serial.py](./comunication_serial/comunication_serial/communicator_serial.py)
+with:
+
+```python
+os.system('sudo shutdown now')
+```
+
+The node runs without a terminal, so `sudo` has nowhere to ask for a password.
+**Without the configuration below the command fails silently**: the LED strip goes
+dark and the OLED shows "Shutting down..", the ESP32 counts down and cuts power
+30 s later — but the computer was never asked to shut down, and it loses power
+while still running.
+
+Grant passwordless sudo for **that one command only** — never a blanket rule:
+
+```bash
+sudo visudo -f /etc/sudoers.d/ros-shutdown
+```
+
+Add a single line, replacing `ubuntu` with the user that runs the node:
+
+```
+ubuntu ALL=(root) NOPASSWD: /sbin/shutdown
+```
+
+Then fix the permissions and confirm the file parses — a broken sudoers file
+locks you out of `sudo` entirely, which is why `visudo` is used instead of a
+plain editor:
+
+```bash
+sudo chmod 0440 /etc/sudoers.d/ros-shutdown
+sudo visudo -c
+```
+
+Verify as the node's user. It must print the shutdown schedule without prompting:
+
+```bash
+sudo -n shutdown --help
+```
+
+If it prints `sudo: a password is required`, the rule is not being matched. Check
+that the path is right for your system — `which shutdown` may report
+`/usr/sbin/shutdown`, and the path in the rule has to match exactly.
+
+> **Do not use `NOPASSWD: ALL`.** It would let anything running as that user gain
+> root, and the node's own attack surface includes a serial line: a `BUTTON;0`
+> frame is trusted purely because it arrived on the wire.
+
+**Prefer not to give the node this power?** Delete the `os.system` call — the
+`BUTTON;0` event is still published, so you can react to it in a dedicated node
+of your own with whatever privileges you consider appropriate.
+
 ### Logging
 
 The node uses the `rclpy` logger, so its output shows up on the console and on `/rosout` like any other node — `ros2 topic echo /rosout` and the standard tooling work with no configuration.

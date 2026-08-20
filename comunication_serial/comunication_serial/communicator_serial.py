@@ -324,7 +324,19 @@ class SerialCommNode(Node):
                                         self.generate_log_msg(
                                             'Shutting down with sudo shutdown now...',
                                             LogsLevel.info)
-                                        os.system('sudo shutdown now')
+                                        # Requires passwordless sudo for this one
+                                        # command (see the README). The node has no
+                                        # terminal, so without it sudo cannot prompt
+                                        # and the host stays up while the ESP32 cuts
+                                        # the power rail 30 s later.
+                                        rc = os.system('sudo shutdown now')
+                                        if rc != 0:
+                                            self.generate_log_msg(
+                                                f'shutdown failed (exit {rc}): the host '
+                                                f'will lose power without a clean '
+                                                f'unmount. Check the sudoers rule '
+                                                f'described in the README.',
+                                                LogsLevel.error)
                                     else:
                                         msg.data = button   # index of the pressed button
                                         self.button_pub.publish(msg)
