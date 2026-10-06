@@ -199,13 +199,13 @@ Solid arrows are direct calls or message flow; dotted arrows mean "reads or writ
 
 ## Firmware architecture
 
-Five execution contexts, explicitly pinned to cores ([esp32.ino](./esp32.ino)):
+Five execution contexts, explicitly pinned to cores ([esp32.ino](./esp32/esp32.ino)):
 
 | Task | Core | Prio | Stack | Role |
 | --- | --- | --- | --- | --- |
-| `serialTask` | 1 | 3 | 2048 | Reads the UART byte by byte, replies with ACK and enqueues into `rxQueue`. The only producer for that queue. |
+| `serialTask` | 1 | 3 | 4096 | Reads the UART byte by byte, replies with ACK and enqueues into `rxQueue`. The only producer for that queue. |
 | `ledStripTask` | 1 | 2 | 1536 | Drives the LED strip from a state variable. |
-| `heartbeatTask` | 1 | 1 | 1536 | Watches `last_ping_ms` and trips the emergency stop. |
+| `heartbeatTask` | 1 | 1 | 4096 | Watches `last_ping_ms` and trips the emergency stop. |
 | `loop()` | 1 | 1 | — | Consumes `rxQueue` and executes the commands. |
 | `buttonTask` | 0 | 1 | 3072 | Polls buttons and monitored pins with a 50 ms debounce. |
 
@@ -245,7 +245,7 @@ Three contexts in [communicator_serial.py](./comunication_serial/comunication_se
 
 ### Firmware
 
-Arduino IDE with ESP32 board support (`https://dl.espressif.com/dl/package_esp32_index.json`), board **ESP32 Dev Module**. Libraries: **Adafruit NeoPixel**, **Adafruit GFX**, **Adafruit SSD1306**. Flash [esp32.ino](./esp32.ino).
+Arduino IDE with ESP32 board support (`https://dl.espressif.com/dl/package_esp32_index.json`), board **ESP32 Dev Module**. Libraries: **Adafruit NeoPixel**, **Adafruit GFX**, **Adafruit SSD1306**. Flash [esp32.ino](./esp32/esp32.ino).
 
 > On Linux, install the Arduino IDE via `apt`, not via `snap`. The snap build bundles a Python older than 3.7 and the upload fails in `flasher.py` with `SyntaxError: future feature annotations is not defined`. Compilation works; only flashing breaks.
 
