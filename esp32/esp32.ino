@@ -1,10 +1,10 @@
 /*
   esp32.ino
 
-  - No dynamic allocation (fixed buffer pool).
-  - serialTask: reads the serial port continuously, replies with ACK/NACK immediately
-                when applicable, and hands the filled buffer index to rxQueue so that
-                loop() can process it.
+  - No dynamic allocation after setup() (fixed buffer pool, static semaphores).
+  - serialTask: reads the serial port continuously, hands the filled buffer index to
+                rxQueue so that loop() can process it, and only then replies ACK
+                (or NACK when there is no room for the line).
   - heartbeatTask: watches last_ping_ms and trips the emergency stop if it exceeds 1 s.
   - buttonTask: polls the buttons with debounce and sends events to the host (with ACK).
   - ledStripTask: drives the LED strip colour.
@@ -12,9 +12,9 @@
 
   Protocol expected from ROS:
   - Heartbeat: "PING"                  (no ACK; restarts the watchdog timer)
-  - Hardware shutdown:                 "MSG;<id>;POWER_OFF"  -> serialTask replies "ACK;<id>\n" on reception
-  - LED strip colour:                  "MSG;<id>;LED;<color>" -> serialTask replies "ACK;<id>\n" on reception
-  - OLED display text:                 "MSG;<id>;DISPLAY;<line_1>;<line_2>" -> serialTask replies "ACK;<id>\n" on reception
+  - Hardware shutdown:                 "MSG;<id>;POWER_OFF"  -> serialTask replies "ACK;<id>\n" once the line is queued
+  - LED strip colour:                  "MSG;<id>;LED;<color>" -> serialTask replies "ACK;<id>\n" once the line is queued
+  - OLED display text:                 "MSG;<id>;DISPLAY;<line_1>;<line_2>" -> serialTask replies "ACK;<id>\n" once the line is queued
   - Change an output pin of the interface board: "MSG;<id>;PINOUT;<pin>;<high/low>"
         (<pin> is a zero-based index, NOT the microcontroller GPIO number; state is high or low)
 
@@ -145,11 +145,17 @@ QueueHandle_t freeQueue = NULL; // queue holding indices (int) of free buffers
 typedef struct {
   bool used;
   unsigned long id;
-  SemaphoreHandle_t sem; // binary
+  SemaphoreHandle_t sem; // binary, created once in setup() and reused for every send
   int status; // 0 = pending, 1 = ACK, 2 = NACK
 } PendingAck;
 
 static PendingAck pendingAcks[POOL_SIZE]; // limited capacity (POOL_SIZE)
+
+// Backing storage for the pendingAcks semaphores. Creating them with the *Static
+// variant keeps them off the FreeRTOS heap, and creating them once in setup() keeps
+// the send path free of allocation: creating and deleting a semaphore per message
+// would allocate and free heap memory for every event sent to the host.
+static StaticSemaphore_t pendingAckSemStorage[POOL_SIZE];
 
 // ---------------- Deduplication of received ids ----------------
 // The sender resends the SAME line (same id) when the ACK does not come back in
@@ -331,7 +337,8 @@ void setup() {
   // fill freeQueue with indices 0..POOL_SIZE-1
   for (int i = 0; i < POOL_SIZE; ++i) {
     pendingAcks[i].used = false;
-    pendingAcks[i].sem = NULL;
+    // cannot fail: the storage is static, so nothing is taken from the heap
+    pendingAcks[i].sem = xSemaphoreCreateBinaryStatic(&pendingAckSemStorage[i]);
     int idx = i;
     xQueueSend(freeQueue, &idx, 0);
   }
@@ -440,7 +447,7 @@ void loop() {
     serialSendLinef("LOOP: message received: %s", msg);
 
     // parse the message (MSG;id;COMMAND;ARGS)
-    // note: the ACK was already sent by serialTask on reception
+    // note: the ACK was already sent by serialTask when the line was queued
     if (strncmp(msg, "MSG;", 4) == 0) {
       const char *p = msg + 4;    // p points just past "MSG;"
       const char *colon = strchr(p, ';'); // first ';' after the id
@@ -540,15 +547,13 @@ static inline void sendNACK_fromISRContextSafe(const char *id, const char *reaso
 static int register_pending_ack(unsigned long id) {
   for (int i = 0; i < POOL_SIZE; ++i) {
     if (!pendingAcks[i].used) {
-      pendingAcks[i].used = true;
+      // The semaphore is reused across sends. A reply that lands between the previous
+      // sender's last timeout and its unregister_pending_ack() leaves a give behind;
+      // drain it so it cannot end this wait early.
+      xSemaphoreTake(pendingAcks[i].sem, 0);
       pendingAcks[i].id = id;
       pendingAcks[i].status = 0;
-      pendingAcks[i].sem = xSemaphoreCreateBinary();
-      if (pendingAcks[i].sem == NULL) {
-        // could not create the semaphore: release the slot and fail
-        pendingAcks[i].used = false;
-        return -1;
-      }
+      pendingAcks[i].used = true;   // last: signal_pending_ack() only matches used slots
       return i;
     }
   }
@@ -558,12 +563,9 @@ static int register_pending_ack(unsigned long id) {
 static void unregister_pending_ack(int idx) {
   if (idx < 0 || idx >= POOL_SIZE) return;
   if (pendingAcks[idx].used) {
-    if (pendingAcks[idx].sem) {
-      vSemaphoreDelete(pendingAcks[idx].sem);
-    }
-    pendingAcks[idx].used = false;
+    // the semaphore stays: it belongs to the slot, not to this send
+    pendingAcks[idx].used = false;   // first: stops signal_pending_ack() matching the slot
     pendingAcks[idx].id = 0;
-    pendingAcks[idx].sem = NULL;
     pendingAcks[idx].status = 0;
   }
 }
@@ -829,8 +831,10 @@ void buttonTask(void *pvParameters) {
    - reads bytes from the UART continuously
    - accumulates them until '\n'
    - "PING" -> refreshes last_ping_ms
-   - "MSG;<id>;..." -> replies ACK;<id> immediately and tries to enqueue the message
-     (uses the buffer pool; if it is full, replies NACK;<id>;NO_BUFFER or NACK;<id>;QUEUE_FULL)
+   - "MSG;<id>;..." -> enqueues the message, then replies ACK;<id>
+     (uses the buffer pool; if it is full, replies NACK;<id>;NO_BUFFER or NACK;<id>;QUEUE_FULL
+     instead of the ACK; a retransmission of an id already queued is re-acknowledged and
+     not enqueued again)
    - any other line -> tries to enqueue it without an ACK
 */
 void serialTask(void *pvParameters) {
@@ -889,16 +893,20 @@ void serialTask(void *pvParameters) {
                 memcpy(idbuf, p, idlen);
                 idbuf[idlen] = '\0';
 
-                // Send the ACK immediately — including for retransmissions: that is
-                // exactly the ACK the sender never received the first time. Dropping
-                // a duplicate silently would make the sender exhaust its attempts and
-                // report failure for a command that already ran.
-                sendACK_fromISRContextSafe(idbuf);
-
+                // The reply is ACK or NACK, never both. The ACK only goes out once the
+                // line is safely in rxQueue, so ACK means "queued for execution"; when
+                // there is no room the sender gets a NACK instead, while it is still
+                // waiting, and can report the failure. (Acknowledging before enqueuing
+                // made the NACK arrive after the ACK, when the sender had already
+                // reported success.)
                 unsigned long id_num = strtoul(idbuf, NULL, 10);
                 if (id_already_processed(id_num)) {
-                  // Retransmission caused by a lost ACK: already re-acknowledged above.
-                  // Enqueuing it again would execute the same command twice.
+                  // Retransmission caused by a lost ACK: the line is already queued or
+                  // executed. Re-acknowledge it (that is exactly the ACK the sender never
+                  // received; staying silent would make it exhaust its attempts and
+                  // report failure for a command that already ran), but do not enqueue
+                  // it again, which would execute the same command twice.
+                  sendACK_fromISRContextSafe(idbuf);
                   serialSendLinef("DUP:%s", idbuf);
                 }
                 else {
@@ -923,11 +931,12 @@ void serialTask(void *pvParameters) {
                       // rather than after execution, because serialTask handles lines
                       // sequentially — by the time a retransmission arrives, this record exists.
                       register_seen_id(id_num);
+                      sendACK_fromISRContextSafe(idbuf);
                     }
                   }
                   else {
-                    // No free buffer. The receiver accepted the line (ACK) but has no slot
-                    // to store it for later processing, so the sender is told explicitly.
+                    // No free buffer to store the line for later processing: refuse it
+                    // explicitly instead of acknowledging a message that will be dropped.
                     sendNACK_fromISRContextSafe(idbuf, "NO_BUFFER");
                   }
                 }
@@ -1021,7 +1030,8 @@ void ledStripTask(void *pvParameters) {
 
 /**
    handle_MSG_command - executes a command (LED/DISPLAY/POWER_OFF/PINOUT)
-   Note: the ACK was already sent on reception; here we only execute and log.
+   Note: the ACK was already sent when the line was queued; here we only execute and
+   log. A failure at this point only shows up as an EXEC_FAIL diagnostic line.
 */
 void handle_MSG_command(const char *id, const char *command, const char *args) {
 
@@ -1081,28 +1091,42 @@ void handle_MSG_command(const char *id, const char *command, const char *args) {
   }
 
   else if (strcmp(command, "PINOUT") == 0) {
-    // args arrives as "<index>;high|low"
-    const char *p = args;
-    const char *colon = strchr(p, ';');
+    // args arrives as "<index>;high|low". Both fields are checked strictly, because
+    // this drives relays: a lenient parse turns a malformed payload into a real
+    // actuation. atoi("x") returns 0, so "x;high" used to switch output 0, and
+    // copying the state into a 5-byte buffer accepted "highXYZ" as "high".
+    const char *colon = strchr(args, ';');
     if (!colon) {   // no ';' means no state; bail out before dereferencing colon
       serialSendLinef("EXEC_FAIL:PINOUT_FORMAT:%s", args);
       return;
     }
 
-    char pin_out_number[3], state[5];
-    size_t len1 = colon - p;
-    if (len1 >= sizeof(pin_out_number)) len1 = sizeof(pin_out_number) - 1;
-    memcpy(pin_out_number, p, len1);
-    pin_out_number[len1] = '\0';
-    strncpy(state, colon + 1, sizeof(state) - 1);
-    state[sizeof(state) - 1] = '\0';
+    // Index: one or more decimal digits and nothing else (no sign, no spaces).
+    // Accumulated by hand and saturated once out of range, so a long run of
+    // digits cannot overflow.
+    bool index_ok = (colon != args);
+    int index = 0;
+    for (const char *c = args; index_ok && c < colon; ++c) {
+      if (*c < '0' || *c > '9') {
+        index_ok = false;
+      } else if (index < PINS_OUT_COUNT) {
+        index = index * 10 + (*c - '0');
+      }
+    }
 
-    signed short int s = atoi(pin_out_number);
-    if (s < 0 || s >= PINS_OUT_COUNT) {   // an out-of-range index would read invalid memory
+    // State: exactly "high" or "low", compared in place rather than copied.
+    const char *state = colon + 1;
+    bool state_ok = (strcmp(state, "high") == 0 || strcmp(state, "low") == 0);
+
+    if (!index_ok || !state_ok) {
+      serialSendLinef("EXEC_FAIL:PINOUT_FORMAT:%s", args);
+      return;
+    }
+    if (index >= PINS_OUT_COUNT) {   // an out-of-range index would read invalid memory
       serialSendLinef("EXEC_FAIL:PINOUT_RANGE:%s", args);
       return;
     }
-    set_logical_gpio(PINS_OUT[s], state);
+    set_logical_gpio(PINS_OUT[index], state);
 
     serialSendLinef("EXEC_OK:PINOUT:%s", args);
     return;

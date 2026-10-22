@@ -1,6 +1,6 @@
 # Reliable Serial Bridge between ESP32 and ROS 2
 
-A lightweight alternative to **micro-ROS** and **rosserial** for connecting microcontrollers to ROS 2, with a real reliability layer (per-message ACK/NACK with ids, retransmission and timeout), a **bidirectional hardware watchdog**, and **zero dynamic allocation** in the firmware.
+A lightweight alternative to **micro-ROS** and **rosserial** for connecting microcontrollers to ROS 2, with a real reliability layer (per-message ACK/NACK with ids, retransmission and timeout), a **bidirectional hardware watchdog**, and **no dynamic allocation after boot** in the firmware.
 
 This is not an ad-hoc serial parser: it is a line protocol with explicit guarantees, built for a mobile robot in continuous operation, where losing a message means leaving an actuator in the wrong state.
 
@@ -50,7 +50,7 @@ This project is the fourth option (a **custom serial bridge**) taken seriously. 
 | End-to-end negotiated QoS | no | **yes** | no | no |
 | Per-message acknowledgement (ACK/NACK) | **yes** | yes (via DDS) | no | via broker QoS |
 | Hardware watchdog / fail-safe | **yes** | no (you implement it) | no | no |
-| Dynamic allocation on the MCU | **none** | yes | yes | yes |
+| Dynamic allocation on the MCU | **none after boot** | yes | yes | yes |
 | Input reading model | **event-driven** | event-driven | *polling* | event-driven |
 | Debounce/filtering on the MCU | **yes** | up to the user | no (on the PC) | up to the user |
 | Runs on flash-constrained MCUs | **yes** | limited | yes | depends |
@@ -68,16 +68,16 @@ This project is the fourth option (a **custom serial bridge**) taken seriously. 
 The ROS node sends `PING` every 500 ms. If the firmware goes 1000 ms without one, it drives the `CONTROL_STOP` output, the motor driver's emergency stop. Cable yanked out, node hung, kernel panic on the PC: the robot stops on its own, depending on nothing from the host side. That guarantee lives in the firmware, not in software.
 
 **2. Per-message reliability, in both directions.**
-Every message carries an incrementing id. The sender registers the id and blocks until the reply arrives, with a timeout and up to 3 retransmissions. Both sides implement this, the ESP32 with FreeRTOS binary semaphores (the task sleeps, it does not busy-wait), Python with `threading.Event`. If there is no resource to process the message, the answer is an explicit `NACK;<id>;REASON` instead of silence.
+Every message carries an incrementing id. The sender registers the id and blocks until the reply arrives, with a timeout and up to 3 retransmissions. Both sides implement this, the ESP32 with FreeRTOS binary semaphores (the task sleeps, it does not busy-wait), Python with `threading.Event`. If there is no resource to process the message, the answer is an explicit `NACK;<id>;REASON` instead of silence. The reply is one or the other, never both: the firmware only acknowledges a line once it is safely queued, so a NACK reaches the sender while it is still waiting.
 
-**ACK and NACK are handled differently, on both sides.** The wait primitive carries the *status* of the reply, not merely the fact that one arrived: a NACK wakes the waiter and returns failure, rather than being mistaken for successful delivery. And a NACK does **not** trigger retransmission, the cause is a lack of resources on the other side (`NO_BUFFER`, `QUEUE_FULL`), not a loss on the link, so resending immediately tends to be refused again. Timeout retransmits; an explicit rejection does not.
+**ACK and NACK are handled differently, on both sides.** The wait primitive carries the *status* of the reply, not merely the fact that one arrived: a NACK wakes the waiter and returns failure, rather than being mistaken for successful delivery. And a NACK does **not** trigger retransmission, the cause is a lack of resources on the other side (`NO_BUFFER`, `QUEUE_FULL`), not a loss on the link, so resending immediately tends to be refused again. Timeout retransmits; an explicit rejection does not. Today only the firmware emits NACK: the node has no fixed pool to run out of, so it always acknowledges.
 
 **Exactly-once delivery, also on both sides.** A retransmission resends the identical line, with the same id, that id is what makes it recognisable. Each receiver keeps a window of the last 16 processed ids: when it recognises a retransmission it **re-acknowledges it** (that ACK is precisely what got lost) but **does not execute it again**.
 
 Without this, an ACK lost on the return path would make the command run twice. And in the MCU → ROS direction the effect would be worse: a single button press would reach ROS as two events on `/button`. This is the kind of failure that shows up once a week, disappears when you go looking for it, and gets blamed on "cable noise".
 
-**3. Zero dynamic allocation in the firmware.**
-No `malloc`, no Arduino `String`, no `new` on the data path. Incoming lines go into a **fixed pool of 10 buffers of 256 bytes**, managed by two FreeRTOS queues (`freeQueue` and `rxQueue`). With no heap on the hot path there is no fragmentation, which matters when the target is running for weeks without a restart.
+**3. No dynamic allocation after boot.**
+No `malloc`, no Arduino `String`, no `new` on the data path. Incoming lines go into a **fixed pool of 10 buffers of 256 bytes**, managed by two FreeRTOS queues (`freeQueue` and `rxQueue`). The semaphores a sender blocks on while it waits for an ACK come from a static array (`xSemaphoreCreateBinaryStatic`) and are created once, in `setup()`, then reused, rather than created and deleted for every message. The queues, the mutex, the task stacks and the display buffer are allocated once at startup; after that, nothing on the data path allocates or frees memory. With no heap on the hot path there is no fragmentation, which matters when the target is running for weeks without a restart.
 
 **4. Atomic serial writes across cores.**
 The tasks run pinned to **different cores** of the ESP32, these are genuinely parallel UART writes, not merely interleaved by the scheduler. A line assembled from several `Serial.print` calls can be split in half by another task's output, and the host receives `ACK;PININ;IN_2;high` followed by a stray number: the ACK **and** the event are both lost at once.
@@ -130,9 +130,9 @@ Non-protocol lines, recorded as logs by the node:
 | --- | --- |
 | `EXEC_OK:<CMD>:<args>` | Command executed. |
 | `EXEC_FAIL:UNKNOWN_CMD:<cmd>` | Unrecognised command. |
-| `EXEC_FAIL:PINOUT_FORMAT` / `PINOUT_RANGE` | Malformed `PINOUT`, or index out of range. |
+| `EXEC_FAIL:PINOUT_FORMAT` / `PINOUT_RANGE` | Malformed `PINOUT` (index not a plain decimal number, or state not exactly `high`/`low`), or index out of range. |
 | `DUP:<id>` | Retransmission recognised: re-acknowledged, but not executed again. |
-| `NACK;<id>;NO_BUFFER` / `QUEUE_FULL` | No free buffer / queue full: message dropped. |
+| `NACK;<id>;NO_BUFFER` / `QUEUE_FULL` | Sent instead of the ACK: no free buffer / queue full, message dropped. |
 | `ERROR:LINEBUF_OVERFLOW` | Line longer than 255 bytes; dropped. |
 
 ### Timing parameters
@@ -158,7 +158,7 @@ flowchart LR
         BTN["buttonTask<br/>Core 0 · prio 1<br/>debounce → BUTTON / PININ"]
         subgraph CORE1["Core 1"]
             direction TB
-            SER["serialTask · prio 3<br/>UART RX, instant ACK,<br/>dedup check, enqueue"]
+            SER["serialTask · prio 3<br/>UART RX, dedup check,<br/>enqueue, then ACK/NACK"]
             HB["heartbeatTask · prio 1<br/>watchdog: PING gap over 1s<br/>drives CONTROL_STOP"]
             LEDT["ledStripTask · prio 2<br/>NeoPixel strip"]
             LOOP["loop() — Arduino main<br/>dequeue rxQueue,<br/>handle_MSG_command()"]
@@ -203,7 +203,7 @@ Five execution contexts, explicitly pinned to cores ([esp32.ino](./esp32/esp32.i
 
 | Task | Core | Prio | Stack | Role |
 | --- | --- | --- | --- | --- |
-| `serialTask` | 1 | 3 | 4096 | Reads the UART byte by byte, replies with ACK and enqueues into `rxQueue`. The only producer for that queue. |
+| `serialTask` | 1 | 3 | 4096 | Reads the UART byte by byte, enqueues into `rxQueue`, then replies ACK (or NACK when there is no room). The only producer for that queue. |
 | `ledStripTask` | 1 | 2 | 1536 | Drives the LED strip from a state variable. |
 | `heartbeatTask` | 1 | 1 | 4096 | Watches `last_ping_ms` and trips the emergency stop. |
 | `loop()` | 1 | 1 | — | Consumes `rxQueue` and executes the commands. |
@@ -465,12 +465,13 @@ cd comunication_serial
 pytest test/test_protocol.py -v
 ```
 
-Nine cases exercise the real `send_message_with_ack()` and `_reader_thread_fn()`:
+Ten cases exercise the real `send_message_with_ack()` and `_reader_thread_fn()`:
 
 | Test | What it pins down |
 | --- | --- |
 | `test_ack_returns_true_after_a_single_transmission` | The happy path does not retransmit. |
 | `test_nack_returns_false_and_is_not_retransmitted` | A NACK returns failure and returns *immediately*, without waiting out the timeout. |
+| `test_firmware_nack_reaches_the_waiting_sender` | The same, end to end: a `NACK;<id>;NO_BUFFER` parsed by the real reader thread wakes the sender. |
 | `test_timeout_exhausts_every_attempt` | Three transmissions before giving up. |
 | `test_ack_on_the_last_attempt_still_succeeds` | A late ACK is still honoured. |
 | `test_pending_table_is_left_clean` | No leaked entries in `pending_acks`. |
@@ -495,7 +496,7 @@ The protocol is not coupled to this project's robot. To move it to another one:
 
 A record of the *why*, for whoever reads the code:
 
-**Why ACK on reception rather than on execution.** `serialTask` replies as soon as it recognises the line format, before enqueuing. That keeps acknowledgement latency constant and decoupled from how long the command takes to run. The cost is explicit and documented under [limitations](#known-limitations): an ACK means "line received", not "command executed".
+**Why ACK on enqueue rather than on execution.** `serialTask` replies as soon as the line is in `rxQueue`, without waiting for `loop()` to run it. That keeps acknowledgement latency constant and decoupled from how long the command takes to run. Acknowledging only *after* the enqueue is what makes the NACK useful: an earlier version acknowledged before enqueuing, so a `NO_BUFFER` NACK arrived after the ACK, when the sender had already reported success. The cost is explicit and documented under [limitations](#known-limitations): an ACK means "command queued", not "command executed".
 
 **Why a fixed pool instead of the heap.** The target is weeks of continuous operation. Heap fragmentation on an MCU is a failure mode that surfaces after days — precisely the worst moment.
 
@@ -505,7 +506,7 @@ A record of the *why*, for whoever reads the code:
 
 **Why no `Serial` inside an ISR.** A FreeRTOS mutex cannot be taken from an interrupt (there is no `xSemaphoreTakeFromISR` for mutexes, precisely because of priority inheritance). The pattern adopted is to raise a flag in the ISR and let the corresponding task emit the line.
 
-**Why validate input coming from a ROS topic.** `/pin_out` is an ordinary topic: any process can publish to it, including a `ros2 topic pub` during debugging. Before the guards were added, a payload without a `;` crashed the microcontroller through an invalid memory access, and on reboot the relays pulsed. External input is external input, even when it comes from "inside" the system.
+**Why validate input coming from a ROS topic.** `/pin_out` is an ordinary topic: any process can publish to it, including a `ros2 topic pub` during debugging. Before the guards were added, a payload without a `;` crashed the microcontroller through an invalid memory access, and on reboot the relays pulsed. The fields are now parsed strictly, too: a lenient `atoi()` turned `x;high` into index 0 and switched a relay, so the index must be a plain decimal number and the state exactly `high` or `low`. External input is external input, even when it comes from "inside" the system.
 
 ## Known limitations
 
@@ -513,7 +514,7 @@ Documented out of honesty, and because they are good starting points for contrib
 
 | Limitation | Effect |
 | --- | --- |
-| **An ACK does not mean execution** | `serialTask` acknowledges before enqueuing. If the pool is full, a `NACK;<id>;NO_BUFFER` follows — but the ACK is already out. |
+| **An ACK means queued, not executed** | `serialTask` acknowledges once the line is in `rxQueue`. If the command then fails (an `EXEC_FAIL:` line, such as `PINOUT_RANGE`), the sender only learns it from that diagnostic line, not through the protocol. |
 | **No ROS message types on the MCU** | The firmware knows nothing about `std_msgs`. All translation happens in the bridge node. |
 | **No end-to-end QoS** | QoS applies from the bridge node into the ROS graph. On the serial link, the guarantee is this protocol's ACK/retry. |
 | **One MCU per node** | The protocol is point-to-point. Multiple MCUs require one node instance each. |

@@ -14,6 +14,7 @@ Run with:  pytest test/test_protocol.py
 
 import importlib.util
 from pathlib import Path
+import queue
 import sys
 import threading
 import time
@@ -137,6 +138,44 @@ def test_nack_returns_false_and_is_not_retransmitted(node):
     assert result is False
     assert node.ser.write.call_count == 1, 'an explicit rejection must not be retried'
     assert elapsed < 0.5, 'a NACK must return immediately, not wait for the timeout'
+
+
+def test_firmware_nack_reaches_the_waiting_sender(node):
+    """The firmware answers NACK instead of ACK when it has no room for the line.
+
+    Unlike the test above, the reply goes through the real ``_reader_thread_fn``:
+    the fake port answers every MSG with ``NACK;<id>;NO_BUFFER``, as the firmware
+    does when its buffer pool is exhausted.
+    """
+    incoming = queue.Queue()
+
+    def write(data):
+        if data.startswith(b'MSG;'):
+            msg_id = data.split(b';')[1]
+            incoming.put(b'NACK;' + msg_id + b';NO_BUFFER\n')
+
+    def readline():
+        try:
+            return incoming.get(timeout=0.05)
+        except queue.Empty:
+            return b''
+
+    node.ser.write.side_effect = write
+    node.ser.readline.side_effect = readline
+    reader = threading.Thread(target=node._reader_thread_fn, daemon=True)
+    reader.start()
+    try:
+        started = time.time()
+        result = node.send_message_with_ack('PINOUT;0;high', retries=3, timeout=1.0)
+        elapsed = time.time() - started
+    finally:
+        node._stop_event.set()
+        reader.join(timeout=1.0)
+
+    assert result is False
+    assert node.ser.write.call_count == 1, 'an explicit rejection must not be retried'
+    assert elapsed < 0.5, 'the NACK must wake the sender, not the timeout'
+    assert node.pending_acks == {}
 
 
 def test_timeout_exhausts_every_attempt(node):

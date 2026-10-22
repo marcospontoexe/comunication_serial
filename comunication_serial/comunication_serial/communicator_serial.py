@@ -381,14 +381,14 @@ class SerialCommNode(Node):
                         pending.reason = reason
                         pending.event.set()
                     else:
-                        # The firmware acknowledges on reception and only then tries to
-                        # enqueue; when there is no buffer, the NACK arrives with the id
-                        # already acknowledged and removed from here. The message was
-                        # accepted and then dropped — we log it explicitly so the case
-                        # does not go unnoticed.
+                        # The firmware sends the NACK instead of the ACK, so normally the
+                        # sender is still waiting for it. No pending entry means the
+                        # sender already gave up after its last timeout and this reply
+                        # came too late; the command was dropped by the firmware either
+                        # way, so log it explicitly rather than let it go unnoticed.
                         self.generate_log_msg(
-                            f'NACK id={nack_id} arrived after the ACK: command dropped '
-                            f'by the firmware ({reason})',
+                            f'Late NACK id={nack_id}: the sender had already timed out; '
+                            f'command dropped by the firmware ({reason})',
                             LogsLevel.warning)
                 else:
                     self.generate_log_msg(f'Malformed NACK: {s}', LogsLevel.warning)
