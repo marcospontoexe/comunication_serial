@@ -1,6 +1,6 @@
 # Reliable Serial Bridge between ESP32 and ROS 2
 
-A lightweight alternative to **micro-ROS** and **rosserial** for connecting microcontrollers to ROS 2 — with a real reliability layer (per-message ACK/NACK with ids, retransmission and timeout), a **bidirectional hardware watchdog**, and **zero dynamic allocation** in the firmware.
+A lightweight alternative to **micro-ROS** and **rosserial** for connecting microcontrollers to ROS 2, with a real reliability layer (per-message ACK/NACK with ids, retransmission and timeout), a **bidirectional hardware watchdog**, and **zero dynamic allocation** in the firmware.
 
 This is not an ad-hoc serial parser: it is a line protocol with explicit guarantees, built for a mobile robot in continuous operation, where losing a message means leaving an actuator in the wrong state.
 
@@ -27,19 +27,19 @@ This is not an ad-hoc serial parser: it is a line protocol with explicit guarant
 
 ## Why this project exists
 
-The robot behind this project runs **Zenoh** (`rmw_zenoh_cpp`) as its RMW, not Fast DDS or Cyclone DDS. That fact alone ruled out the obvious answer: **micro-ROS does not support Zenoh**. Its agent-based bridge (Micro XRCE-DDS) is built and maintained around Fast DDS and, to a lesser extent, Cyclone DDS — there is no supported path to plug a micro-ROS Agent straight into a Zenoh-based graph. So before any trade-off comparison, the field was already narrowed to whatever could sit on plain serial and talk to the ROS graph through an ordinary node, which is what a bridge node in `rclpy` does regardless of which RMW it is compiled against.
+The robot behind this project runs **Zenoh** (`rmw_zenoh_cpp`) as its RMW, not Fast DDS or Cyclone DDS. That fact alone ruled out the obvious answer: **micro-ROS does not support Zenoh**. Its agent-based bridge (Micro XRCE-DDS) is built and maintained around Fast DDS and, to a lesser extent, Cyclone DDS ( there is no supported path to plug a micro-ROS Agent straight into a Zenoh-based graph). So before any trade-off comparison, the field was already narrowed to whatever could sit on plain serial and talk to the ROS graph through an ordinary node, which is what a bridge node in `rclpy` does regardless of which RMW it is compiled against.
 
 More generally, when you need to connect a microcontroller to ROS 2, the usual options are:
 
-**micro-ROS** is the official and most complete solution: the MCU becomes a real ROS 2 node, with standard message types and QoS. The cost is the stack: the firmware embeds a **Micro XRCE-DDS** client, and you must keep a separate process — the **micro-ROS Agent** — running on the computer to bridge into the ROS 2 graph. On flash-constrained MCUs (a 2 MB ESP32, for instance) that weighs, and the Agent is one more piece to start, monitor and restart in the system lifecycle.
+**micro-ROS** is the official and most complete solution: the MCU becomes a real ROS 2 node, with standard message types and QoS. The cost is the stack: the firmware embeds a **Micro XRCE-DDS** client, and you must keep a separate process (the **micro-ROS Agent**) running on the computer to bridge into the ROS 2 graph. On flash-constrained MCUs (a 2 MB ESP32, for instance) that weighs, and the Agent is one more piece to start, monitor and restart in the system lifecycle.
 
 **rosserial** solved this problem on ROS 1, but was never officially ported to ROS 2.
 
 **Firmata / Telemetrix** turn the MCU into an I/O slave driven by the PC. Simple, but the model is *polling*: the PC asks for the pin state and waits for the answer, adding the round-trip time to every read. And the protocol is generic (MIDI-derived), spending several header and metadata bytes to read a single pin. Unusable for anything with timing requirements.
 
-**MQTT** is great for fleets and telemetry, but requires a broker on the network and adds latency — it is not for control.
+**MQTT** is great for fleets and telemetry, but requires a broker on the network and adds latency, it is not for control.
 
-This project is the fourth option — a **custom serial bridge** — taken seriously. The fair criticism of that approach is that "you have to write and maintain the parser on both sides". This repository's answer is that the parser is already written, proven in operation, and ships with the parts a home-grown bridge usually lacks: per-message acknowledgement, retransmission, a watchdog, and concurrency safety.
+This project is the fourth option (a **custom serial bridge**) taken seriously. The fair criticism of that approach is that "you have to write and maintain the parser on both sides". This repository's answer is that the parser is already written, proven in operation, and ships with the parts a home-grown bridge usually lacks: per-message acknowledgement, retransmission, a watchdog, and concurrency safety.
 
 ## How it compares to the alternatives
 
@@ -58,39 +58,39 @@ This project is the fourth option — a **custom serial bridge** — taken serio
 
 **On middleware:** the bridge node is an ordinary ROS 2 node written in `rclpy`. It inherits the system's `RMW_IMPLEMENTATION` — Fast DDS, Cyclone DDS or **Zenoh** (`rmw_zenoh_cpp`) — with no extra configuration and without the firmware ever knowing about it. That is the same property the micro-ROS Agent provides, minus the intermediate process.
 
-**Where the other options win:** if you need standard ROS message types generated on the MCU itself, end-to-end negotiated QoS, or several MCUs announcing themselves dynamically on the network, **use micro-ROS** — that is what it exists for, *provided your graph runs on Fast DDS or Cyclone DDS*. If your RMW is Zenoh, that option is off the table today; **zenoh-pico** is the closer architectural match if you can take on a more involved MCU setup, since it drops the Agent entirely. This project fills a specific niche: **a point-to-point serial link, with a safety requirement and a minimal footprint**, that does not care which RMW sits behind the bridge node.
+**Where the other options win:** if you need standard ROS message types generated on the MCU itself, end-to-end negotiated QoS, or several MCUs announcing themselves dynamically on the network, **use micro-ROS** that is what it exists for, *provided your graph runs on Fast DDS or Cyclone DDS*. If your RMW is Zenoh, that option is off the table today; **zenoh-pico** is the closer architectural match if you can take on a more involved MCU setup, since it drops the Agent entirely. This project fills a specific niche: **a point-to-point serial link, with a safety requirement and a minimal footprint**, that does not care which RMW sits behind the bridge node.
 
-> ⚠️ **No published benchmarks.** The differences above are structural (number of processes, protocol layers, reading model), not measurements. I have not run a latency comparison against micro-ROS. If you measure one, open an issue — it is the most useful contribution this repository can receive.
+> ⚠️ **No published benchmarks.** The differences above are structural (number of processes, protocol layers, reading model), not measurements. I have not run a latency comparison against micro-ROS. If you measure one, open an issue (it is the most useful contribution this repository can receive).
 
 ## What sets it apart from a plain serial parser
 
 **1. Bidirectional watchdog with a hardware fail-safe.**
-The ROS node sends `PING` every 500 ms. If the firmware goes 1000 ms without one, it drives the `CONTROL_STOP` output — the motor driver's emergency stop. Cable yanked out, node hung, kernel panic on the PC: the robot stops on its own, depending on nothing from the host side. That guarantee lives in the firmware, not in software.
+The ROS node sends `PING` every 500 ms. If the firmware goes 1000 ms without one, it drives the `CONTROL_STOP` output, the motor driver's emergency stop. Cable yanked out, node hung, kernel panic on the PC: the robot stops on its own, depending on nothing from the host side. That guarantee lives in the firmware, not in software.
 
 **2. Per-message reliability, in both directions.**
-Every message carries an incrementing id. The sender registers the id and blocks until the reply arrives, with a timeout and up to 3 retransmissions. Both sides implement this — the ESP32 with FreeRTOS binary semaphores (the task sleeps, it does not busy-wait), Python with `threading.Event`. If there is no resource to process the message, the answer is an explicit `NACK;<id>;REASON` instead of silence.
+Every message carries an incrementing id. The sender registers the id and blocks until the reply arrives, with a timeout and up to 3 retransmissions. Both sides implement this, the ESP32 with FreeRTOS binary semaphores (the task sleeps, it does not busy-wait), Python with `threading.Event`. If there is no resource to process the message, the answer is an explicit `NACK;<id>;REASON` instead of silence.
 
-**ACK and NACK are handled differently, on both sides.** The wait primitive carries the *status* of the reply, not merely the fact that one arrived: a NACK wakes the waiter and returns failure, rather than being mistaken for successful delivery. And a NACK does **not** trigger retransmission — the cause is a lack of resources on the other side (`NO_BUFFER`, `QUEUE_FULL`), not a loss on the link, so resending immediately tends to be refused again. Timeout retransmits; an explicit rejection does not.
+**ACK and NACK are handled differently, on both sides.** The wait primitive carries the *status* of the reply, not merely the fact that one arrived: a NACK wakes the waiter and returns failure, rather than being mistaken for successful delivery. And a NACK does **not** trigger retransmission, the cause is a lack of resources on the other side (`NO_BUFFER`, `QUEUE_FULL`), not a loss on the link, so resending immediately tends to be refused again. Timeout retransmits; an explicit rejection does not.
 
-**Exactly-once delivery, also on both sides.** A retransmission resends the identical line, with the same id — that id is what makes it recognisable. Each receiver keeps a window of the last 16 processed ids: when it recognises a retransmission it **re-acknowledges it** (that ACK is precisely what got lost) but **does not execute it again**.
+**Exactly-once delivery, also on both sides.** A retransmission resends the identical line, with the same id, that id is what makes it recognisable. Each receiver keeps a window of the last 16 processed ids: when it recognises a retransmission it **re-acknowledges it** (that ACK is precisely what got lost) but **does not execute it again**.
 
 Without this, an ACK lost on the return path would make the command run twice. And in the MCU → ROS direction the effect would be worse: a single button press would reach ROS as two events on `/button`. This is the kind of failure that shows up once a week, disappears when you go looking for it, and gets blamed on "cable noise".
 
 **3. Zero dynamic allocation in the firmware.**
-No `malloc`, no Arduino `String`, no `new` on the data path. Incoming lines go into a **fixed pool of 10 buffers of 256 bytes**, managed by two FreeRTOS queues (`freeQueue` and `rxQueue`). With no heap on the hot path there is no fragmentation — which matters when the target is running for weeks without a restart.
+No `malloc`, no Arduino `String`, no `new` on the data path. Incoming lines go into a **fixed pool of 10 buffers of 256 bytes**, managed by two FreeRTOS queues (`freeQueue` and `rxQueue`). With no heap on the hot path there is no fragmentation, which matters when the target is running for weeks without a restart.
 
 **4. Atomic serial writes across cores.**
-The tasks run pinned to **different cores** of the ESP32 — these are genuinely parallel UART writes, not merely interleaved by the scheduler. A line assembled from several `Serial.print` calls can be split in half by another task's output, and the host receives `ACK;PININ;IN_2;high` followed by a stray number: the ACK **and** the event are both lost at once.
+The tasks run pinned to **different cores** of the ESP32, these are genuinely parallel UART writes, not merely interleaved by the scheduler. A line assembled from several `Serial.print` calls can be split in half by another task's output, and the host receives `ACK;PININ;IN_2;high` followed by a stray number: the ACK **and** the event are both lost at once.
 
 Every write goes through `serialSendLine()`/`serialSendLinef()`, protected by a FreeRTOS mutex. **A mutex and not a binary semaphore**, because of priority inheritance: `serialTask` runs at priority 3, and when it blocks on a mutex held by a priority-1 task, that task is temporarily promoted and releases quickly. A binary semaphore would allow priority inversion.
 
 This is a subtle bug that appears intermittently and is easy to blame on the cable. It is fixed here.
 
 **5. Processing on the MCU, not on the PC.**
-The 50 ms debounce happens in the firmware. The ESP32 only speaks once it is sure the pin actually changed state — instead of dumping dozens of noise transitions onto the bus for the PC to filter. Inputs are event-driven: the moment a pin changes, the firmware pushes the message. No request/response round-trip.
+The 50 ms debounce happens in the firmware. The ESP32 only speaks once it is sure the pin actually changed state, instead of dumping dozens of noise transitions onto the bus for the PC to filter. Inputs are event-driven: the moment a pin changes, the firmware pushes the message. No request/response round-trip.
 
 **6. Debuggable with a serial monitor.**
-The protocol is text. You can open the Arduino Serial Monitor, type `MSG;1;DISPLAY;Line 1;Line 2` and watch the hardware respond — with no ROS running, no agent, no binary decoder. That changes how long field diagnosis takes.
+The protocol is text. You can open the Arduino Serial Monitor, type `MSG;1;DISPLAY;Line 1;Line 2` and watch the hardware respond, with no ROS running, no agent, no binary decoder. That changes how long field diagnosis takes.
 
 ## Protocol
 
@@ -120,7 +120,7 @@ The `<id>` is an incrementing counter kept **independently on each side**: each 
 | Message | Effect |
 | --- | --- |
 | `MSG;<id>;BUTTON;<n>` | Button pressed (falling edge, debounced). `<n>` is an index into `BUTTON_PINS[]`. |
-| `MSG;<id>;PININ;<pin_name>;<high\|low>` | A monitored pin changed state, in either direction. `<pin_name>` is the `#define` name, resolved at compile time. Also sent at boot with the initial state — the ROS side never has to assume one. |
+| `MSG;<id>;PININ;<pin_name>;<high\|low>` | A monitored pin changed state, in either direction. `<pin_name>` is the `#define` name, resolved at compile time. Also sent at boot with the initial state, the ROS side never has to assume one. |
 
 ### Diagnostics
 
@@ -195,7 +195,7 @@ flowchart LR
     GRAPH --> SUB
 ```
 
-Solid arrows are direct calls or message flow; dotted arrows mean "reads or writes this shared state". The two dedup windows (`seenIds` on the firmware, `_seen_ids` on the node) are what make a retransmitted message safe to re-acknowledge without re-executing it — see [exactly-once delivery](#what-sets-it-apart-from-a-plain-serial-parser) above.
+Solid arrows are direct calls or message flow; dotted arrows mean "reads or writes this shared state". The two dedup windows (`seenIds` on the firmware, `_seen_ids` on the node) are what make a retransmitted message safe to re-acknowledge without re-executing it, see [exactly-once delivery](#what-sets-it-apart-from-a-plain-serial-parser) above.
 
 ## Firmware architecture
 
@@ -211,7 +211,7 @@ Five execution contexts, explicitly pinned to cores ([esp32.ino](./esp32/esp32.i
 
 > In the ESP-IDF FreeRTOS port (used by the Arduino-ESP32 core) the stack parameter and the return value of `uxTaskGetStackHighWaterMark()` are in **bytes**, not in words as in vanilla FreeRTOS.
 
-Splitting `serialTask` (which only receives and enqueues) from `loop()` (which executes) is deliberate: the ACK goes out in microseconds regardless of whether the command takes 30 seconds to run — as `POWER_OFF` does, with its countdown. `loop()` prints every task's stack high water mark every 5 s, so stack sizing is verifiable rather than guessed.
+Splitting `serialTask` (which only receives and enqueues) from `loop()` (which executes) is deliberate: the ACK goes out in microseconds regardless of whether the command takes 30 seconds to run, as `POWER_OFF` does, with its countdown. `loop()` prints every task's stack high water mark every 5 s, so stack sizing is verifiable rather than guessed.
 
 ## ROS 2 node architecture
 
@@ -260,7 +260,7 @@ colcon build --packages-select comunication_serial
 source install/setup.bash
 ```
 
-No external dependencies beyond `rclpy`, `std_msgs` and `pyserial` — all resolved by `rosdep`.
+No external dependencies beyond `rclpy`, `std_msgs` and `pyserial`, all resolved by `rosdep`.
 
 The node will not start yet: it opens `/dev/ESP`, which has to be created first (next section). With the symlink in place:
 
@@ -324,7 +324,7 @@ sudo udevadm control --reload-rules
 sudo udevadm trigger
 ```
 
-Unplug and replug the USB cable — the symlink is only created when udev processes a new connection event.
+Unplug and replug the USB cable, the symlink is only created when udev processes a new connection event.
 
 **4. Verify**
 
@@ -373,7 +373,7 @@ PORT = "/dev/ttyUSB0"
 
 Button 0 is the hardware power button. When it is pressed, the firmware sends
 `BUTTON;0` and the node shuts the host computer down before the ESP32 cuts the
-power rail — so the filesystem is unmounted cleanly instead of losing power
+power rail, so the filesystem is unmounted cleanly instead of losing power
 mid-write. That is done in [communicator_serial.py](./comunication_serial/comunication_serial/communicator_serial.py)
 with:
 
@@ -384,7 +384,7 @@ os.system('sudo shutdown now')
 The node runs without a terminal, so `sudo` has nowhere to ask for a password.
 **Without the configuration below the command fails silently**: the LED strip goes
 dark and the OLED shows "Shutting down..", the ESP32 counts down and cuts power
-30 s later — but the computer was never asked to shut down, and it loses power
+30 s later, but the computer was never asked to shut down, and it loses power
 while still running.
 
 Grant passwordless sudo for **that one command only** — never a blanket rule:
@@ -399,7 +399,7 @@ Add a single line, replacing `ubuntu` with the user that runs the node:
 ubuntu ALL=(root) NOPASSWD: /sbin/shutdown
 ```
 
-Then fix the permissions and confirm the file parses — a broken sudoers file
+Then fix the permissions and confirm the file parses, a broken sudoers file
 locks you out of `sudo` entirely, which is why `visudo` is used instead of a
 plain editor:
 
@@ -415,7 +415,7 @@ sudo -n shutdown --help
 ```
 
 If it prints `sudo: a password is required`, the rule is not being matched. Check
-that the path is right for your system — `which shutdown` may report
+that the path is right for your system, `which shutdown` may report
 `/usr/sbin/shutdown`, and the path in the rule has to match exactly.
 
 > **Do not use `NOPASSWD: ALL`.** It would let anything running as that user gain
@@ -428,7 +428,7 @@ of your own with whatever privileges you consider appropriate.
 
 ### Logging
 
-The node uses the `rclpy` logger, so its output shows up on the console and on `/rosout` like any other node — `ros2 topic echo /rosout` and the standard tooling work with no configuration.
+The node uses the `rclpy` logger, so its output shows up on the console and on `/rosout` like any other node, `ros2 topic echo /rosout` and the standard tooling work with no configuration.
 
 The level is controlled by a single constant at the top of the file:
 
@@ -436,7 +436,7 @@ The level is controlled by a single constant at the top of the file:
 LOG_LEVEL = LogsLevel.info   # debug | info | warning | error | fatal
 ```
 
-It also adjusts the node logger's severity, so raising it to `LogsLevel.debug` starts showing every ACK exchange — which is the way to diagnose communication problems.
+It also adjusts the node logger's severity, so raising it to `LogsLevel.debug` starts showing every ACK exchange, which is the way to diagnose communication problems.
 
 To keep history on disk, set `LOG_FILE`; a stdlib `RotatingFileHandler` then receives the same messages, without replacing the ROS logger:
 
@@ -454,7 +454,7 @@ MSG;2;LED;Verde
 MSG;3;PINOUT;0;high
 ```
 
-The firmware replies `ACK;1`, `EXEC_OK:DISPLAY:Hello;ROS 2` and so on. Note that without the `PING`s the watchdog trips the emergency stop after 1 second — that is the expected behaviour.
+The firmware replies `ACK;1`, `EXEC_OK:DISPLAY:Hello;ROS 2` and so on. Note that without the `PING`s the watchdog trips the emergency stop after 1 second, that is the expected behaviour.
 
 ### Running the tests
 
@@ -501,11 +501,11 @@ A record of the *why*, for whoever reads the code:
 
 **Why text and not binary.** A binary protocol would be more compact. Debuggability with a serial monitor won: for this system's message volume (discrete events, not sensor streaming), bandwidth was never the bottleneck. For high-rate telemetry the choice would be different.
 
-**Why a mutex and not a binary semaphore on the serial.** Priority inheritance — explained [above](#what-sets-it-apart-from-a-plain-serial-parser).
+**Why a mutex and not a binary semaphore on the serial.** Priority inheritance, explained [above](#what-sets-it-apart-from-a-plain-serial-parser).
 
 **Why no `Serial` inside an ISR.** A FreeRTOS mutex cannot be taken from an interrupt (there is no `xSemaphoreTakeFromISR` for mutexes, precisely because of priority inheritance). The pattern adopted is to raise a flag in the ISR and let the corresponding task emit the line.
 
-**Why validate input coming from a ROS topic.** `/pin_out` is an ordinary topic: any process can publish to it, including a `ros2 topic pub` during debugging. Before the guards were added, a payload without a `;` crashed the microcontroller through an invalid memory access — and on reboot the relays pulsed. External input is external input, even when it comes from "inside" the system.
+**Why validate input coming from a ROS topic.** `/pin_out` is an ordinary topic: any process can publish to it, including a `ros2 topic pub` during debugging. Before the guards were added, a payload without a `;` crashed the microcontroller through an invalid memory access, and on reboot the relays pulsed. External input is external input, even when it comes from "inside" the system.
 
 ## Known limitations
 
@@ -526,4 +526,4 @@ Documented out of honesty, and because they are good starting points for contrib
 
 ---
 
-Contributions are welcome — measurements especially. If you run this protocol on different hardware, open an issue and say so: a body of real-world cases is what validates a project like this.
+Contributions are welcome, measurements especially. If you run this protocol on different hardware, open an issue and say so: a body of real-world cases is what validates a project like this.
