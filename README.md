@@ -135,6 +135,8 @@ Non-protocol lines, recorded as logs by the node:
 | `NACK;<id>;NO_BUFFER` / `QUEUE_FULL` | Sent instead of the ACK: no free buffer / queue full, message dropped. |
 | `ERROR:LINEBUF_OVERFLOW` | Line longer than 255 bytes; dropped. |
 
+The node logs every line that starts with `EXEC_FAIL:`, `ERROR:` or `WARN:` as a **warning** (`ESP_ALERT_PREFIXES`), so an execution failure also shows up at the default log level (`info`); all other diagnostic lines go to `debug`. The text is `Host received -> <line>` either way.
+
 ### Timing parameters
 
 | Parameter | Value | Constant |
@@ -436,7 +438,7 @@ The level is controlled by a single constant at the top of the file:
 LOG_LEVEL = LogsLevel.info   # debug | info | warning | error | fatal
 ```
 
-It also adjusts the node logger's severity, so raising it to `LogsLevel.debug` starts showing every ACK exchange, which is the way to diagnose communication problems.
+It also adjusts the node logger's severity, so raising it to `LogsLevel.debug` starts showing every ACK exchange, which is the way to diagnose communication problems. Failures reported by the firmware (`EXEC_FAIL:`, `ERROR:`, `WARN:` lines) are warnings, so they show at `info` too.
 
 To keep history on disk, set `LOG_FILE`; a stdlib `RotatingFileHandler` then receives the same messages, without replacing the ROS logger:
 
@@ -465,7 +467,7 @@ cd comunication_serial
 pytest test/test_protocol.py -v
 ```
 
-Ten cases exercise the real `send_message_with_ack()` and `_reader_thread_fn()`:
+24 cases (17 test functions, two of them parametrised) exercise the real `send_message_with_ack()` and `_reader_thread_fn()`. Every test runs with `os.system` replaced by a recorder, so the power-button branch can never shut down the machine running the suite:
 
 | Test | What it pins down |
 | --- | --- |
@@ -479,8 +481,28 @@ Ten cases exercise the real `send_message_with_ack()` and `_reader_thread_fn()`:
 | `test_distinct_ids_are_both_published` | Deduplication does not swallow legitimate messages. |
 | `test_duplicate_pinin_is_published_once` | Same guarantee for `PININ` events. |
 | `test_id_reused_after_the_window_expires_is_treated_as_new` | The documented limit of the 16-id window. |
+| `test_pinin_with_an_invalid_state_is_not_published` | A `PININ` state other than exactly `high`/`low` is acknowledged but not published. |
+| `test_power_button_shuts_down_and_is_not_published` | `BUTTON;0` runs the shutdown, turns the strip and display off, and never reaches `/button`. |
+| `test_nack_after_the_ack_from_an_older_firmware_is_logged` | With a firmware from before the ACK-on-enqueue fix (ACK, then NACK) the sender reports success, and the late NACK still leaves a warning. |
+| `test_nack_with_no_sender_waiting_is_logged_as_a_warning` | A NACK that arrives after the last timeout is not silent. |
+| `test_esp_failure_lines_are_logged_as_warnings` | `EXEC_FAIL:`, `ERROR:` and `WARN:` lines are warnings (parametrised). |
+| `test_ordinary_esp_lines_stay_at_debug` | Every other diagnostic line stays at `debug` (parametrised). |
+| `test_esp_failure_shows_at_the_default_info_level` | At `LOG_LEVEL = info` a failure shows and the noise does not. |
 
 Under a full ROS 2 workspace they also run through `colcon test --packages-select comunication_serial`, alongside the standard `ament` lint checks.
+
+### Hardware check: NACK on a full pool
+
+The unit tests cannot prove the firmware side of "ACK or NACK, never both", and the node cannot trigger it either: it sends one message at a time and waits for the reply. [tools/check_nack_on_full_pool.py](./tools/check_nack_on_full_pool.py) talks to the port directly and sends a burst of 20 `DISPLAY` commands faster than `loop()` runs them, then prints a verdict per id: **PASSED** (each id got an ACK *or* a NACK, at least one NACK, and only the acknowledged ones ran), **FAILED** (some id got both, the old firmware's order) or **INCONCLUSIVE** (the pool did not fill, or a line was lost).
+
+```bash
+# stop the bridge node first: the script refuses to run while another process holds the port
+python3 tools/check_nack_on_full_pool.py
+```
+
+It sends no `PING`, so the emergency stop stays engaged for the whole run, which is the safe state. The burst is paced (8 ms between lines) so it does not overflow the 256-byte UART receive buffer of the ESP32, which would turn the check into "lost lines" instead of "full pool".
+
+**Validated on hardware.** The three firmware fixes were ported to the production firmware of the robot this bridge was built for and checked there on 2026-10-23: the strict `PINOUT` parse answered `x;high`, `0;highXYZ` and `;high` with `EXEC_FAIL:PINOUT_FORMAT` and `3;high` with `PINOUT_RANGE` (with the latch closed, `x;high` left it closed, where the old `atoi()` parse would have opened it), and this script returned **PASSED** (12 acknowledged and executed, 8 refused with `NO_BUFFER` and not executed, no id with both).
 
 ## Adapting it to your hardware
 
@@ -514,7 +536,7 @@ Documented out of honesty, and because they are good starting points for contrib
 
 | Limitation | Effect |
 | --- | --- |
-| **An ACK means queued, not executed** | `serialTask` acknowledges once the line is in `rxQueue`. If the command then fails (an `EXEC_FAIL:` line, such as `PINOUT_RANGE`), the sender only learns it from that diagnostic line, not through the protocol. |
+| **An ACK means queued, not executed** | `serialTask` acknowledges once the line is in `rxQueue`. If the command then fails (an `EXEC_FAIL:` line, such as `PINOUT_RANGE`), the sender only learns it from that diagnostic line, not through the protocol. The node logs that line as a warning, so it is visible at the default log level. |
 | **No ROS message types on the MCU** | The firmware knows nothing about `std_msgs`. All translation happens in the bridge node. |
 | **No end-to-end QoS** | QoS applies from the bridge node into the ROS graph. On the serial link, the guarantee is this protocol's ACK/retry. |
 | **One MCU per node** | The protocol is point-to-point. Multiple MCUs require one node instance each. |

@@ -90,6 +90,57 @@ def node():
     return n
 
 
+@pytest.fixture(autouse=True)
+def recorded_os_system(monkeypatch):
+    """
+    Replace os.system with a recorder in EVERY test.
+
+    BUTTON;0 runs 'sudo shutdown now'; without this net, a test that reaches that
+    branch would shut down the machine running the suite.
+    """
+    calls = []
+    monkeypatch.setattr(comm.os, 'system', lambda cmd: calls.append(cmd) or 0)
+    return calls
+
+
+class _RecordingLogger:
+    """Stand-in for the rclpy logger: keeps (level, message) pairs in a list."""
+
+    def __init__(self, records):
+        self._records = records
+
+    def debug(self, msg):
+        self._records.append(('debug', msg))
+
+    def info(self, msg):
+        self._records.append(('info', msg))
+
+    def warning(self, msg):
+        self._records.append(('warning', msg))
+
+    def error(self, msg):
+        self._records.append(('error', msg))
+
+    def fatal(self, msg):
+        self._records.append(('fatal', msg))
+
+
+@pytest.fixture
+def logged_node(node, monkeypatch):
+    """Like ``node``, but with the real generate_log_msg recording into node.logged."""
+    monkeypatch.setattr(comm, 'LOG_LEVEL', comm.LogsLevel.debug)   # capture everything
+    del node.generate_log_msg   # drop the no-op from the node fixture: the real method runs
+    node.logged = []
+    node.get_logger = lambda: _RecordingLogger(node.logged)
+    node._file_logger = None
+    return node
+
+
+def levels_of(node, fragment):
+    """Return the levels of the logged messages that contain the fragment."""
+    return [level for level, msg in node.logged if fragment in msg]
+
+
 def reply(node, status, reason='', delay=0.05):
     """Simulate the reader thread answering the pending message."""
 
@@ -226,3 +277,105 @@ def test_id_reused_after_the_window_expires_is_treated_as_new(node):
 
     assert node.button_pub.publish.call_count == 1 + window + 1
     assert len(node._seen_ids) == window, 'the window must never grow past its limit'
+
+
+def test_pinin_with_an_invalid_state_is_not_published(node):
+    # the state must be exactly high or low; the line is still acknowledged
+    feed(node, [b'MSG;10;PININ;IN_2;HIGH\n'])
+    node.pinin_pub.publish.assert_not_called()
+    acks = [call.args[0] for call in node.ser.write.call_args_list]
+    assert acks == [b'ACK;10\n']
+
+
+def test_power_button_shuts_down_and_is_not_published(node, recorded_os_system):
+    # The node reuses one message object for /LEDs and /oled, so record .data at
+    # call time; a MagicMock would only keep the object, already overwritten.
+    leds, oled = [], []
+    node.led_pub.publish.side_effect = lambda m: leds.append(m.data)
+    node.oled_pub.publish.side_effect = lambda m: oled.append(m.data)
+
+    feed(node, [b'MSG;11;BUTTON;0\n'])
+
+    assert recorded_os_system == ['sudo shutdown now']
+    node.button_pub.publish.assert_not_called()
+    assert leds == ['Apagado']
+    assert oled == [';Shutting down..']
+
+
+# ---------------------------------- late NACK ----------------------------------
+
+def test_nack_after_the_ack_from_an_older_firmware_is_logged(logged_node):
+    """
+    A firmware flashed before the ACK-on-enqueue fix ACKs first and NACKs later.
+
+    The sender already returned True on the ACK; the NACK that follows finds no
+    pending entry and must still leave a warning behind.
+    """
+    node = logged_node
+    incoming = queue.Queue()
+
+    def write(data):
+        if data.startswith(b'MSG;'):
+            msg_id = data.split(b';')[1]
+            incoming.put(b'ACK;' + msg_id + b'\n')
+            incoming.put(b'NACK;' + msg_id + b';QUEUE_FULL\n')
+
+    def readline():
+        try:
+            return incoming.get(timeout=0.05)
+        except queue.Empty:
+            return b''
+
+    node.ser.write.side_effect = write
+    node.ser.readline.side_effect = readline
+    reader = threading.Thread(target=node._reader_thread_fn, daemon=True)
+    reader.start()
+    try:
+        assert node.send_message_with_ack('LED;Azul', retries=3, timeout=1.0) is True
+        deadline = time.time() + 1.0   # the NACK is read after the sender returns
+        while not levels_of(node, 'Late NACK') and time.time() < deadline:
+            time.sleep(0.01)
+    finally:
+        node._stop_event.set()
+        reader.join(timeout=1.0)
+
+    assert levels_of(node, 'Late NACK') == ['warning']
+
+
+def test_nack_with_no_sender_waiting_is_logged_as_a_warning(logged_node):
+    # e.g. the NACK arrived after the sender's last timeout
+    feed(logged_node, [b'NACK;42;NO_BUFFER\n'])
+    assert levels_of(logged_node, 'Late NACK id=42') == ['warning']
+
+
+# --------------------------- ESP diagnostic lines ---------------------------
+
+@pytest.mark.parametrize('line', [
+    'EXEC_FAIL:PINOUT_FORMAT:x;high',
+    'EXEC_FAIL:PINOUT_RANGE:3;high',
+    'EXEC_FAIL:UNKNOWN_CMD:FOO',
+    'ERROR:LINEBUF_OVERFLOW',
+    'ERROR: lost communication with the OLED display!',
+    'WARN:NO_PENDING_SLOT',
+])
+def test_esp_failure_lines_are_logged_as_warnings(logged_node, line):
+    feed(logged_node, [(line + '\n').encode()])
+    assert levels_of(logged_node, f'Host received -> {line}') == ['warning']
+
+
+@pytest.mark.parametrize('line', [
+    'EXEC_OK:PINOUT:0;high',
+    'GPIO_SETTED_HIGH:32',
+    'DUP:7',
+])
+def test_ordinary_esp_lines_stay_at_debug(logged_node, line):
+    feed(logged_node, [(line + '\n').encode()])
+    assert levels_of(logged_node, f'Host received -> {line}') == ['debug']
+
+
+def test_esp_failure_shows_at_the_default_info_level(logged_node, monkeypatch):
+    # with the production level (info) the failure shows and the noise stays hidden
+    monkeypatch.setattr(comm, 'LOG_LEVEL', comm.LogsLevel.info)
+    feed(logged_node, [b'GPIO_SETTED_HIGH:32\n', b'EXEC_FAIL:PINOUT_FORMAT:x;high\n'])
+    assert logged_node.logged == [
+        ('warning', 'Host received -> EXEC_FAIL:PINOUT_FORMAT:x;high')]
