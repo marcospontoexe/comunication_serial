@@ -112,7 +112,8 @@ LOG_FILE_BACKUP_COUNT = 3
 class PendingAck:
     """State of a sent message that is waiting for a reply.
 
-    Mirrors the PendingAck struct in the firmware: the Event wakes whoever is
+    Mirrors the PendingAck slot in the firmware, where a task notification plays
+    the Event's role and its value carries the status: the Event wakes whoever is
     waiting, and the status says *why* it woke up. Without the status a NACK (an
     explicit rejection) would be indistinguishable from an ACK, and the sender
     would report success for a message the other side threw away.

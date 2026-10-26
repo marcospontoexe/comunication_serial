@@ -1,7 +1,8 @@
 /*
   esp32.ino
 
-  - No dynamic allocation after setup() (fixed buffer pool, static semaphores).
+  - No dynamic allocation after setup() (fixed buffer pool; senders wait for their
+    ACK on a task notification, which needs no kernel object).
   - serialTask: reads the serial port continuously, hands the filled buffer index to
                 rxQueue so that loop() can process it, and only then replies ACK
                 (or NACK when there is no room for the line).
@@ -142,20 +143,30 @@ QueueHandle_t rxQueue = NULL;   // queue holding indices (int) of filled buffers
 QueueHandle_t freeQueue = NULL; // queue holding indices (int) of free buffers
 
 // ---------------- Pending ACKs (for messages the ESP sent and is waiting on) ----------
+// A sender registers the id it waits for and blocks on its own task notification;
+// when ACK;<id> or NACK;<id> arrives, serialTask finds the slot and notifies that
+// task, with the reply's status in the notification value. Every task has a
+// notification built in, so there is no kernel object to create, delete or
+// allocate per message.
 typedef struct {
   bool used;
   unsigned long id;
-  SemaphoreHandle_t sem; // binary, created once in setup() and reused for every send
-  int status; // 0 = pending, 1 = ACK, 2 = NACK
+  TaskHandle_t waiter;   // task blocked in send_msg_with_ack_esp() for this id
 } PendingAck;
 
 static PendingAck pendingAcks[POOL_SIZE]; // limited capacity (POOL_SIZE)
 
-// Backing storage for the pendingAcks semaphores. Creating them with the *Static
-// variant keeps them off the FreeRTOS heap, and creating them once in setup() keeps
-// the send path free of allocation: creating and deleting a semaphore per message
-// would allocate and free heap memory for every event sent to the host.
-static StaticSemaphore_t pendingAckSemStorage[POOL_SIZE];
+// Guards pendingAcks and the outgoing id counter. Two tasks send (buttonTask on
+// core 0, loop() on core 1 for POWER_OFF) while serialTask looks slots up, so on a
+// dual-core chip a plain "used" flag is not enough. A spinlock rather than a mutex:
+// the sections are a few instructions long and must never block. No FreeRTOS call
+// is made while holding it.
+static portMUX_TYPE pendingAcksMux = portMUX_INITIALIZER_UNLOCKED;
+
+// Reply status carried in the low 2 bits of the notification value.
+const uint32_t REPLY_TIMEOUT = 0;
+const uint32_t REPLY_ACK = 1;
+const uint32_t REPLY_NACK = 2;
 
 // ---------------- Deduplication of received ids ----------------
 // The sender resends the SAME line (same id) when the ACK does not come back in
@@ -200,7 +211,8 @@ void runShutdownCountdown(int seconds);
 // pendingAcks helpers
 static int register_pending_ack(unsigned long id);
 static void unregister_pending_ack(int idx);
-static void signal_pending_ack(unsigned long id, int status);
+static void signal_pending_ack(unsigned long id, uint32_t status);
+static uint32_t wait_for_reply(unsigned long id, unsigned long timeout_ms);
 // deduplication of received ids
 static bool id_already_processed(unsigned long id);
 static void register_seen_id(unsigned long id);
@@ -337,8 +349,7 @@ void setup() {
   // fill freeQueue with indices 0..POOL_SIZE-1
   for (int i = 0; i < POOL_SIZE; ++i) {
     pendingAcks[i].used = false;
-    // cannot fail: the storage is static, so nothing is taken from the heap
-    pendingAcks[i].sem = xSemaphoreCreateBinaryStatic(&pendingAckSemStorage[i]);
+    pendingAcks[i].waiter = NULL;
     int idx = i;
     xQueueSend(freeQueue, &idx, 0);
   }
@@ -527,13 +538,18 @@ static inline void sendACK_fromISRContextSafe(const char *id) {
 }
 
 unsigned long int generate_msg_id(void) {
-  // Short incrementing id (avoids a heavyweight uuid).
+  // Short incrementing id (avoids a heavyweight uuid). Two tasks on different cores
+  // send, so the increment is guarded: two messages with the same id would be taken
+  // for a retransmission and the second one dropped by the host.
   static unsigned long int idCont = 0;
+  portENTER_CRITICAL(&pendingAcksMux);
   idCont++;
   if (idCont >= 4294967294) {
     idCont = 0;
   }
-  return idCont;
+  unsigned long int id = idCont;
+  portEXIT_CRITICAL(&pendingAcksMux);
+  return id;
 }
 
 /**
@@ -544,40 +560,92 @@ static inline void sendNACK_fromISRContextSafe(const char *id, const char *reaso
 }
 
 // ---------------- pendingAcks implementation ----------------
+/**
+   pack_reply - builds the notification value for a reply: the low 30 bits of the id
+   above the 2-bit status. The waiter compares the id part with its own, so a late
+   reply to an earlier message is never taken as the answer to the current one. This
+   matters because the notification is shared: Arduino-ESP32 builds FreeRTOS with a
+   single notification slot per task (configTASK_NOTIFICATION_ARRAY_ENTRIES = 1), so
+   one cannot be reserved for replies.
+*/
+static inline uint32_t pack_reply(unsigned long id, uint32_t status) {
+  return ((uint32_t)(id & 0x3FFFFFFFUL) << 2) | (status & 0x3);
+}
+
 static int register_pending_ack(unsigned long id) {
+  TaskHandle_t self = xTaskGetCurrentTaskHandle();   // outside the spinlock
+  int slot = -1;
+  portENTER_CRITICAL(&pendingAcksMux);
   for (int i = 0; i < POOL_SIZE; ++i) {
     if (!pendingAcks[i].used) {
-      // The semaphore is reused across sends. A reply that lands between the previous
-      // sender's last timeout and its unregister_pending_ack() leaves a give behind;
-      // drain it so it cannot end this wait early.
-      xSemaphoreTake(pendingAcks[i].sem, 0);
+      pendingAcks[i].used = true;
       pendingAcks[i].id = id;
-      pendingAcks[i].status = 0;
-      pendingAcks[i].used = true;   // last: signal_pending_ack() only matches used slots
-      return i;
+      pendingAcks[i].waiter = self;
+      slot = i;
+      break;
     }
   }
-  return -1; // no free slot
+  portEXIT_CRITICAL(&pendingAcksMux);
+  return slot;   // -1: no free slot
 }
 
 static void unregister_pending_ack(int idx) {
   if (idx < 0 || idx >= POOL_SIZE) return;
-  if (pendingAcks[idx].used) {
-    // the semaphore stays: it belongs to the slot, not to this send
-    pendingAcks[idx].used = false;   // first: stops signal_pending_ack() matching the slot
-    pendingAcks[idx].id = 0;
-    pendingAcks[idx].status = 0;
+  portENTER_CRITICAL(&pendingAcksMux);
+  pendingAcks[idx].used = false;
+  pendingAcks[idx].id = 0;
+  pendingAcks[idx].waiter = NULL;
+  portEXIT_CRITICAL(&pendingAcksMux);
+}
+
+/**
+   signal_pending_ack - called by serialTask on ACK;<id> (REPLY_ACK) or NACK;<id>
+   (REPLY_NACK): wakes the task waiting for that id, if any.
+*/
+static void signal_pending_ack(unsigned long id, uint32_t status) {
+  TaskHandle_t waiter = NULL;
+  portENTER_CRITICAL(&pendingAcksMux);
+  for (int i = 0; i < POOL_SIZE; ++i) {
+    if (pendingAcks[i].used && pendingAcks[i].id == id) {
+      waiter = pendingAcks[i].waiter;
+      break;
+    }
+  }
+  portEXIT_CRITICAL(&pendingAcksMux);
+
+  // Notified outside the spinlock. If the sender gave up in between, the id packed
+  // into the value makes its next wait discard this reply.
+  if (waiter) {
+    xTaskNotify(waiter, pack_reply(id, status), eSetValueWithOverwrite);
   }
 }
 
-static void signal_pending_ack(unsigned long id, int status) {
-  for (int i = 0; i < POOL_SIZE; ++i) {
-    if (pendingAcks[i].used && pendingAcks[i].id == id) {
-      pendingAcks[i].status = status; // 1 = ACK, 2 = NACK
-      if (pendingAcks[i].sem) {
-        xSemaphoreGive(pendingAcks[i].sem);
-      }
-      break;
+/**
+   wait_for_reply - blocks the calling task until the reply to `id` arrives or
+   timeout_ms elapses. The task sleeps in the Blocked state: no CPU is used while it
+   waits.
+
+   @return REPLY_ACK, REPLY_NACK, or REPLY_TIMEOUT.
+
+   A notification whose id part is not ours (a late reply to an earlier message) is
+   discarded, and the wait goes on for the time that is left.
+*/
+static uint32_t wait_for_reply(unsigned long id, unsigned long timeout_ms) {
+  const uint32_t expected = pack_reply(id, 0);
+  const TickType_t timeout = pdMS_TO_TICKS(timeout_ms);
+  const TickType_t start = xTaskGetTickCount();
+
+  for (;;) {
+    TickType_t elapsed = xTaskGetTickCount() - start;
+    if (elapsed >= timeout) return REPLY_TIMEOUT;
+
+    uint32_t value = 0;
+    // clear nothing on entry, everything on exit: each notification is read once
+    if (xTaskNotifyWait(0, UINT32_MAX, &value, timeout - elapsed) != pdTRUE) {
+      return REPLY_TIMEOUT;
+    }
+    if ((value & ~(uint32_t)0x3) == expected) {
+      return value & 0x3;
     }
   }
 }
@@ -646,23 +714,18 @@ bool send_msg_with_ack_esp(const char *payload, int retries, unsigned long timeo
   for (int attempt = 1; attempt < (retries + 1); ++attempt) {
     serialSendLine(full);
 
-    // wait with timeout
-    if (xSemaphoreTake(pendingAcks[slot].sem, pdMS_TO_TICKS(timeout_ms)) == pdTRUE) {
-      // we were signalled; check the status
-      if (pendingAcks[slot].status == 1) {
-        success = true;
-        break;
-      } else if (pendingAcks[slot].status == 2) {
-        // explicit NACK from the host: no automatic retry, the cause is a lack of
-        // resources on the other side rather than a loss on the link
-        success = false;
-        break;
-      } else {
-        // spurious signal: treat as a failure and possibly retry
-      }
-    } else {
-      // timeout: retry if attempts remain
+    uint32_t reply = wait_for_reply(id, timeout_ms);
+    if (reply == REPLY_ACK) {
+      success = true;
+      break;
     }
+    if (reply == REPLY_NACK) {
+      // explicit NACK from the host: no automatic retry, the cause is a lack of
+      // resources on the other side rather than a loss on the link
+      success = false;
+      break;
+    }
+    // REPLY_TIMEOUT: retry if attempts remain
   }
 
   unregister_pending_ack(slot);
@@ -853,7 +916,7 @@ void serialTask(void *pvParameters) {
           if (strncmp(lineBuf, "ACK;", 4) == 0) {
             const char *p = lineBuf + 4;
             unsigned long id = strtoul(p, NULL, 10);
-            signal_pending_ack(id, 1);
+            signal_pending_ack(id, REPLY_ACK);
           }
           else if (strncmp(lineBuf, "NACK;", 5) == 0) {
             const char *p = lineBuf + 5;
@@ -871,7 +934,7 @@ void serialTask(void *pvParameters) {
             else {
               id = strtoul(p, NULL, 10);
             }
-            signal_pending_ack(id, 2);
+            signal_pending_ack(id, REPLY_NACK);
           }
           else if (strcmp(lineBuf, "PING") == 0) {
             last_ping_ms = millis();
