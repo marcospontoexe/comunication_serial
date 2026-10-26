@@ -88,6 +88,19 @@ SEEN_IDS_MAXLEN = 16
 # lines, and at debug level the default LOG_LEVEL (info) hid them.
 ESP_ALERT_PREFIXES = ('EXEC_FAIL:', 'ERROR:', 'WARN:')
 
+# Signal that the ESP already accepts commands. Opening the port resets the ESP
+# through DTR (see __init__), and it takes ~3 s until serialTask is up (measured on
+# the production robot). Transient-local topics (/LEDs, /oled) hand the node a
+# command right at startup; sent inside that window it spent its retries and was
+# only acknowledged on the 3rd attempt (3 x 1 s): no margin at all. The ESP is ready
+# once it echoes a PING (the firmware prints this line) or sends any protocol line
+# (ACK, NACK, or MSG such as the boot PININ events).
+ESP_READY_LINE = 'PING received'
+ESP_READY_PREFIXES = ('ACK;', 'NACK;', 'MSG;')
+# Upper bound for that wait. Past it the node sends anyway and stops waiting (a
+# firmware without the echo must not block the node), with one warning in the log.
+ESP_READY_TIMEOUT_S = 10.0
+
 # Optional rotating log file. None = only the rclpy logger, which already writes
 # to the console and to /rosout. Set a path to keep history on disk, for example
 # '/var/log/serial_comm_node.log'.
@@ -167,6 +180,19 @@ class SerialCommNode(Node):
             # if the port cannot be opened, log it and re-raise for visibility
             self.generate_log_msg(f'Failed to open serial port {PORT}: {e}', LogsLevel.error)
             raise
+
+        # Set by the reader thread once the ESP shows it accepts commands (see
+        # ESP_READY_LINE); send_message_with_ack waits for it before sending.
+        self._esp_ready = threading.Event()
+        self._esp_ready_lock = threading.Lock()   # a single warning if the wait times out
+        self._start = time.monotonic()            # to measure how long the ESP took
+
+        # Drop whatever arrived before the port was opened: a stale PING echo would
+        # mark the ESP as ready before the reset just below.
+        try:
+            self.ser.reset_input_buffer()
+        except Exception:
+            pass   # not critical: worst case the wait ends early, as before
 
         # toggle DTR to reset the microcontroller, so it does not stay in bootloader mode
         try:
@@ -253,6 +279,16 @@ class SerialCommNode(Node):
             except Exception:
                 self.generate_log_msg(f'Could not decode line: {line}', LogsLevel.error)
                 continue
+
+            # Does the ESP accept commands yet? The first line that only a running
+            # serialTask produces (see ESP_READY_LINE) releases whoever waits in
+            # send_message_with_ack. The ESP boot banner does not count.
+            if not self._esp_ready.is_set() and (
+                    s == ESP_READY_LINE or s.startswith(ESP_READY_PREFIXES)):
+                self._esp_ready.set()
+                self.generate_log_msg(
+                    f'ESP ready {time.monotonic() - self._start:.1f} s after opening the port',
+                    LogsLevel.info)
 
             # The ESP sent a MSG to the host: acknowledge it and process it
             if s.startswith('MSG;'):
@@ -459,6 +495,20 @@ class SerialCommNode(Node):
         if self._file_logger:
             self._file_logger.log(STD_LEVEL[log_type], msg)
 
+    def _wait_for_esp_ready(self):
+        """Block until the ESP accepts commands, or for ESP_READY_TIMEOUT_S at most."""
+        if self._esp_ready.wait(ESP_READY_TIMEOUT_S):
+            return   # ready (after startup this returns at once)
+        # Timed out: send anyway, and later sends no longer wait. The lock keeps it to
+        # a single warning if two senders time out together.
+        with self._esp_ready_lock:
+            if not self._esp_ready.is_set():
+                self._esp_ready.set()
+                self.generate_log_msg(
+                    f'ESP did not show it was ready within {ESP_READY_TIMEOUT_S:.0f} s '
+                    f"(no '{ESP_READY_LINE}' or protocol line); sending anyway",
+                    LogsLevel.warning)
+
     def send_message_with_ack(self, command_payload, retries=DEFAULT_RETRIES,
                               timeout=ACK_TIMEOUT):
         r"""Send a payload as MSG;<id>;<command_payload>\n and wait for ACK;<id>.
@@ -470,7 +520,13 @@ class SerialCommNode(Node):
         not retransmitted: the cause is a lack of resources on the other side rather
         than a loss on the link, so resending immediately tends to be refused again.
         This is the same rule the firmware's send_msg_with_ack_esp follows.
+
+        At startup it first waits for the ESP to be ready (see ESP_READY_LINE).
         """
+        # Reset through DTR in __init__, the ESP does not accept commands for ~3 s:
+        # wait for it, so the command does not burn its retries inside that window.
+        self._wait_for_esp_ready()
+
         msg_id = str(self._generate_msg_id())
         full = f'MSG;{msg_id};{command_payload}\n'
         self.generate_log_msg(

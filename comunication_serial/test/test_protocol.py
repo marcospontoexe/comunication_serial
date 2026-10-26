@@ -81,6 +81,11 @@ def node():
     n.pending_lock = threading.Lock()
     n._stop_event = threading.Event()
     n._seen_ids = comm.deque(maxlen=comm.SEEN_IDS_MAXLEN)
+    # ESP already ready: protocol tests do not wait for startup (see the startup tests)
+    n._esp_ready = threading.Event()
+    n._esp_ready.set()
+    n._esp_ready_lock = threading.Lock()
+    n._start = time.monotonic()
     n.generate_log_msg = lambda *args, **kwargs: None
     n.ser = MagicMock()
     n.button_pub = MagicMock()
@@ -379,3 +384,90 @@ def test_esp_failure_shows_at_the_default_info_level(logged_node, monkeypatch):
     feed(logged_node, [b'GPIO_SETTED_HIGH:32\n', b'EXEC_FAIL:PINOUT_FORMAT:x;high\n'])
     assert logged_node.logged == [
         ('warning', 'Host received -> EXEC_FAIL:PINOUT_FORMAT:x;high')]
+
+
+# ------------------- startup: wait for the ESP to be ready -------------------
+
+def _start_reader_answering_acks(node, incoming):
+    """Run the real reader on a fake port that ACKs every MSG the node writes."""
+
+    def write(data):
+        if data.startswith(b'MSG;'):
+            incoming.put(b'ACK;' + data.split(b';')[1] + b'\n')
+
+    def readline():
+        try:
+            return incoming.get(timeout=0.05)
+        except queue.Empty:
+            return b''
+
+    node.ser.write.side_effect = write
+    node.ser.readline.side_effect = readline
+    reader = threading.Thread(target=node._reader_thread_fn, daemon=True)
+    reader.start()
+    return reader
+
+
+def test_send_waits_for_the_esp_to_echo_a_ping(logged_node):
+    # the ESP is rebooting after the DTR reset: nothing goes out before the PING echo
+    node = logged_node
+    node._esp_ready.clear()
+    incoming = queue.Queue()
+    reader = _start_reader_answering_acks(node, incoming)
+    result = []
+    try:
+        sender = threading.Thread(
+            target=lambda: result.append(node.send_message_with_ack('LED;Verde', timeout=1.0)))
+        sender.start()
+        time.sleep(0.3)
+        assert node.ser.write.call_count == 0, 'nothing may be sent before the ESP is ready'
+        incoming.put(b'PING received\n')   # serialTask is up
+        sender.join(timeout=2.0)
+    finally:
+        node._stop_event.set()
+        reader.join(timeout=1.0)
+
+    assert result == [True]
+    assert node.ser.write.call_count == 1, 'acknowledged on the 1st attempt, no retries spent'
+    assert levels_of(node, 'ESP ready') == ['info']
+
+
+def test_a_msg_from_the_esp_also_shows_it_is_ready(node):
+    # e.g. the PININ events the ESP sends at boot
+    node._esp_ready.clear()
+    feed(node, [b'MSG;1;PININ;IN_0;high\n'])
+    assert node._esp_ready.is_set()
+
+
+@pytest.mark.parametrize('line', [
+    b'ets Jul 29 2019 12:21:46\n',
+    b'rst:0x1 (POWERON_RESET),boot:0x17 (SPI_FAST_FLASH_BOOT)\n',
+    b'mode:DIO, clock div:1\n',
+    b'\n',
+])
+def test_the_esp_boot_banner_does_not_count_as_ready(node, line):
+    node._esp_ready.clear()
+    feed(node, [line])
+    assert not node._esp_ready.is_set()
+
+
+def test_without_a_ready_signal_it_sends_after_the_timeout_with_one_warning(
+        logged_node, monkeypatch):
+    # a firmware without the PING echo: wait once, warn, and carry on
+    monkeypatch.setattr(comm, 'ESP_READY_TIMEOUT_S', 0.2)
+    node = logged_node
+    node._esp_ready.clear()
+    incoming = queue.Queue()
+    reader = _start_reader_answering_acks(node, incoming)
+    try:
+        started = time.monotonic()
+        assert node.send_message_with_ack('LED;Verde', timeout=1.0) is True
+        assert time.monotonic() - started >= 0.2
+        # the second send does not wait again, and does not repeat the warning
+        started = time.monotonic()
+        assert node.send_message_with_ack('LED;Azul', timeout=1.0) is True
+        assert time.monotonic() - started < 0.15
+    finally:
+        node._stop_event.set()
+        reader.join(timeout=1.0)
+    assert levels_of(node, 'did not show it was ready') == ['warning']

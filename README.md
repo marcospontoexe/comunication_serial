@@ -223,6 +223,8 @@ Three contexts in [communicator_serial.py](./comunication_serial/comunication_se
 2. **`_reader_thread`** — blocking `readline()`; dispatches ACK/NACK to the pending entries and publishes MCU events onto the topics.
 3. **`_heartbeat_thread`** — `PING` every 500 ms.
 
+**Startup: the node waits for the ESP32 to be ready before its first send.** Opening the port resets the ESP32 through DTR, and the board takes about 3 s before `serialTask` accepts commands. Transient-local topics (`/LEDs`, `/oled`) hand the node a command right at startup, and sent inside that window it spent all three attempts: on the production robot the first `LED` command was only acknowledged on the 3rd one (3 × 1 s, no margin). `send_message_with_ack()` now waits for the first PING echo (`PING received`) or any `ACK`/`NACK`/`MSG` from the ESP32, and logs `ESP ready X s after opening the port`. The ESP32 boot banner does not count. The wait is bounded by `ESP_READY_TIMEOUT_S` (10 s): past it, the node warns once and sends anyway, so a firmware without the echo cannot block it. The input buffer is flushed before the reset, so a stale echo cannot release the wait early. Validated on the production robot: ready after 2.9 s, first command acknowledged on the 1st attempt.
+
 ### Topics
 
 **Subscribed (ROS → ESP)**
@@ -467,7 +469,7 @@ cd comunication_serial
 pytest test/test_protocol.py -v
 ```
 
-24 cases (17 test functions, two of them parametrised) exercise the real `send_message_with_ack()` and `_reader_thread_fn()`. Every test runs with `os.system` replaced by a recorder, so the power-button branch can never shut down the machine running the suite:
+31 cases (21 test functions, three of them parametrised) exercise the real `send_message_with_ack()` and `_reader_thread_fn()`. Every test runs with `os.system` replaced by a recorder, so the power-button branch can never shut down the machine running the suite:
 
 | Test | What it pins down |
 | --- | --- |
@@ -488,6 +490,10 @@ pytest test/test_protocol.py -v
 | `test_esp_failure_lines_are_logged_as_warnings` | `EXEC_FAIL:`, `ERROR:` and `WARN:` lines are warnings (parametrised). |
 | `test_ordinary_esp_lines_stay_at_debug` | Every other diagnostic line stays at `debug` (parametrised). |
 | `test_esp_failure_shows_at_the_default_info_level` | At `LOG_LEVEL = info` a failure shows and the noise does not. |
+| `test_send_waits_for_the_esp_to_echo_a_ping` | At startup nothing is sent before the PING echo, and the command is then acknowledged on the 1st attempt. |
+| `test_a_msg_from_the_esp_also_shows_it_is_ready` | A `MSG` from the ESP32 (the boot `PININ` events) also releases the wait. |
+| `test_the_esp_boot_banner_does_not_count_as_ready` | The ROM boot banner lines do not release it (parametrised). |
+| `test_without_a_ready_signal_it_sends_after_the_timeout_with_one_warning` | A firmware without the echo costs one bounded wait and one warning, not a blocked node. |
 
 Under a full ROS 2 workspace they also run through `colcon test --packages-select comunication_serial`, alongside the standard `ament` lint checks.
 
