@@ -510,6 +510,27 @@ It sends no `PING`, so the emergency stop stays engaged for the whole run, which
 
 **Validated on hardware.** The three firmware fixes were ported to the production firmware of the robot this bridge was built for and checked there on 2026-10-23: the strict `PINOUT` parse answered `x;high`, `0;highXYZ` and `;high` with `EXEC_FAIL:PINOUT_FORMAT` and `3;high` with `PINOUT_RANGE` (with the latch closed, `x;high` left it closed, where the old `atoi()` parse would have opened it), and this script returned **PASSED** (12 acknowledged and executed, 8 refused with `NO_BUFFER` and not executed, no id with both).
 
+### Hardware check: the ESP32 waiting for an ACK
+
+The firmware's half of the reliability layer (wait, resend, give up, never resend after a NACK) does not show with the node running: the node replies at once, and the ESP32's result lines only reach the log at debug level. [tools/check_ack_wait.py](./tools/check_ack_wait.py) takes the node's place. It resets the ESP32 through DTR, as the node does, and answers the first three ESP32 events in three different ways:
+
+| Event | Script reply | Expected from the ESP32 |
+| --- | --- | --- |
+| 1 (boot `PININ`) | none, then a late ACK | 3 sends of the same id, ~1 s apart, then `no ACK`; the late ACK is ignored |
+| 2 | ACK, twice | 1 send, then `ACK received` |
+| 3 | NACK | 1 send only, then `no ACK` |
+
+This firmware monitors a single pin, so it sends one boot `PININ`, and the script asks for two presses of buttons 1–4 for events 2 and 3. Never press button 0: it is the power button.
+
+```bash
+# stop the bridge node first: the script refuses to run while another process holds the port
+python3 tools/check_ack_wait.py
+```
+
+It sends no `PING`, so the emergency stop stays engaged for the whole run. Two limits: the firmware that waited on binary semaphores passes as well (the check proves the mechanism works, not the difference), and the race that the id packed into the notification guards against cannot be triggered from outside, since it lasts microseconds. The double ACK of event 2 only exercises that race by luck; if it does and the filter is broken, event 3 ends with `ACK received` instead of the NACK.
+
+**Validated on hardware.** The task-notification wait was ported to the production firmware of the robot and checked there on 2026-10-28 with the Portuguese version of this script. That firmware monitors three pins, so its three boot `PININ` events were the three events. The verdict was **PASSED**: event 1 was sent at t = 0.00, 1.00 and 2.00 s and given up at 3.01 s, event 2 was acknowledged on its only send in 0.04 s, and event 3 was given up after its only send in 0.05 s. With the node running again, 20 events (3 boot `PININ`, 14 button presses, 2 latch transitions and 1 call from a LoRa button, a second sender task in that firmware) were each acknowledged on the first attempt and published once, with ids 1 to 20 in sequence and no duplicate. The smallest free stacks were 1364 bytes in `buttonTask` and 2520 in the LoRa task, out of 3072.
+
 ## Adapting it to your hardware
 
 The protocol is not coupled to this project's robot. To move it to another one:

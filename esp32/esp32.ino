@@ -836,7 +836,10 @@ void buttonTask(void *pvParameters) {
                 else {
                   serialSendLine("BUTTON_EVENT: no ACK from the host (timeout)");
                 }
-                serialSendLinef("BUTTON %d pressed", pin);
+                // Print the index (the same as in the BUTTON;<i> sent to the host) and the
+                // GPIO. With only the GPIO, button 1 on GPIO0 showed up as "BUTTON 0
+                // pressed", which reads as the power button.
+                serialSendLinef("BUTTON %d (GPIO %d) pressed", i, pin);
               }
             }
             // update the steady state
